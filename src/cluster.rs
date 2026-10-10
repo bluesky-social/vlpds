@@ -1778,7 +1778,8 @@ impl Cluster {
         // Both only while the validity left covers the next tick with room
         // to spare: a slow write earns validity from its send, so one that
         // landed late (or failed late) is renewed at once, 429 or not.
-        let gap = self.cfg.lease_key_gap.map_or_else(|| lease_key_gap(self.cfg.renew_every), |g| g.min(self.cfg.renew_every));
+        let gap =
+            self.cfg.lease_key_gap.map_or_else(|| lease_key_gap(self.cfg.renew_every), |g| g.min(self.cfg.renew_every));
         let last = *self.last_lease_write.lock();
         if let Some((at, landed, joined, draining)) = last {
             let since = at.elapsed();
