@@ -181,6 +181,15 @@ codegen-units = 16
 # keep symbols for profiling (sample/perf/pprof)
 debug = 1
 
+# Published releases (the image workflow on v* tags, CARGO_PROFILE=dist in the
+# Dockerfile): fat LTO and one codegen unit used 2.5-3.4% less CPU per commit
+# than release's thin LTO in the 2026-10-03 A/B, for an image build of ~6 min
+# against ~2, so only tagged builds pay for it.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 # fast iteration builds: `cargo build --profile dev-release`. No LTO and
 # incremental, so an edit recompiles only the crate; dependencies are built
 # once at full opt-level and cached. Benches/deploys use --release.

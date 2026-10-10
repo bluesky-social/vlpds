@@ -72,7 +72,10 @@ ARG VLPDS_FEATURES=""
 # no debug info in the image (Cargo.toml keeps debug = 1 for local profiling;
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
-ENV CARGO_PROFILE_RELEASE_DEBUG=0
+ENV CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_DIST_DEBUG=0
+# release (thin LTO) by default; the image workflow builds tags with dist (fat
+# LTO, one codegen unit: Cargo.toml), which takes several times as long.
+ARG CARGO_PROFILE=release
 # tokio-console compiled in, off until TOKIO_CONSOLE_BIND is set (docs/operations/monitoring.md).
 # --build-arg RUSTFLAGS= builds without it.
 ARG RUSTFLAGS="--cfg tokio_unstable"
@@ -94,9 +97,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
          export "CARGO_TARGET_${T}_LINKER=$gnu-gcc" "CC_$(echo "$t" | tr - _)=$gnu-gcc" \
                 "CXX_$(echo "$t" | tr - _)=$gnu-g++" "AR_$(echo "$t" | tr - _)=$gnu-ar"; \
        fi \
-    && cargo build --release --locked --target "$t" --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
+    && cargo build --profile "$CARGO_PROFILE" --locked --target "$t" --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
     && mkdir -p /out \
-    && cp target/$t/release/vlpds target/$t/release/vlpds-bucket-probe /out/ \
+    && cp target/$t/$CARGO_PROFILE/vlpds target/$t/$CARGO_PROFILE/vlpds-bucket-probe /out/ \
     && if [ "$TARGETARCH" = "$BUILDARCH" ]; then /out/vlpds --help >/dev/null && /out/vlpds-bucket-probe --help >/dev/null; fi
 
 # --- runtime ----------------------------------------------------------------
