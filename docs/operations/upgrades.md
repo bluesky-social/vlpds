@@ -160,10 +160,11 @@ The format inventory (every persisted and wire format, and how it's versioned) i
 ## Releases
 
 A release is a git tag `vMAJOR.MINOR.PATCH` on
-[github.com/jazware/vlpds](https://github.com/jazware/vlpds/tags). Its version is the one in
-`Cargo.toml` at the tagged commit, and a running node reports it in `_health` as
-`<version>+<rev>`. Tags never move. Commits between releases build and run too, but only tags get
-the promises below.
+[github.com/jazware/vlpds](https://github.com/jazware/vlpds/tags), with a
+[GitHub Release](https://github.com/jazware/vlpds/releases) listing the commits since the previous
+one and the image, `ghcr.io/jazware/vlpds:<version>`. Its version is the one in `Cargo.toml` at
+the tagged commit, and a running node reports it in `_health` as `<version>+<rev>`. Tags never
+move. Commits between releases build and run too, but only tags get the promises below.
 
 vlpds is developed in a monorepo, where the same release is the tag `vlpds-v<version>`. This
 repo's history is exported from it, and the export publishes each tag on the commit it made from
