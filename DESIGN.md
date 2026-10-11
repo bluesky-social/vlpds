@@ -1487,11 +1487,25 @@ net:
   floor held it, the next LIST waits for the floor to move. If the log ran
   out, it waits one window, since later segments are younger.
 - Dead logs (`LIST log/`): skipped while the live log set is the one the
-  last full scan saw, and that scan found no dead logs, or only retired
-  ones whose fences aren't due (until the earliest fence turns older than
-  `--fence-retention`). A log dies as a live one, which changes the set.
-  A log never seen live (a joiner that died before anyone listed it) waits
-  up to an hour; nobody can prune it before someone fences it anyway.
+  last full scan saw, and that scan found no dead logs, or only ones
+  waiting for a known time: retired ones whose fences aren't due (until
+  the fence turns older than `--fence-retention`) and ones pruned up to a
+  segment inside the window (nobody writes a dead log, so nothing is due
+  before that segment ages). A log dies as a live one, which changes the
+  set. A log never seen live (a joiner that died before anyone listed it)
+  waits up to an hour; nobody can prune it before someone fences it
+  anyway. A scan LISTs only the dead logs that are due. A retired log's
+  fence is immutable, so it skips the hourly safety net too.
+
+A log's next LIST waits until its next segment is older than the window
+plus a slack of window ÷ 72, at most 1 h (1 h at the default 72 h). One
+LIST then deletes an hour of segments instead of one per pass, and
+segments live up to an hour past the window, which only lengthens
+backfill. Before this, a leader LISTed every retired log and every
+pruning dead log (twice), plus `assign/` and `retain/`, on every pass
+while any dead log was pruning: 44 LISTs a minute on a production node
+in Oct 2026 (35 retired, 3 pruning), about $9/month in R2 Class A and
+four fifths of the node's Class A requests.
 
 So an idle node's passes make no requests. A longer interval only delays
 deletes and retirements, by up to one interval. Metric:

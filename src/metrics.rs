@@ -91,7 +91,7 @@ lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpd
 lazy!(RETENTION_DELETED_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_bytes_total", "Log bytes deleted by retention, by log (own, dead)", &["log"]));
 lazy!(RETENTION_PRUNED_SEQ: IntGauge = register_int_gauge!("vlpds_retention_pruned_seq", "Highest seq this node has deleted from any log (older cursors get OutdatedCursor)"));
 lazy!(RETENTION_REPLAY_HOLD: IntGauge = register_int_gauge!("vlpds_retention_replay_hold_segments", "Segments of our log kept only because a crash replay could still need them (durable ordinal - replay floor)"));
-lazy!(RETENTION_LISTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlpds_retention_lists_skipped_total", "Retention LISTs a pass skipped because nothing could be due yet (own: our log's first segment is inside the window or held by the replay floor; dead: no dead logs but retired ones whose fences aren't due, live set unchanged); each still runs at least hourly", &["list"]));
+lazy!(RETENTION_LISTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlpds_retention_lists_skipped_total", "Retention LISTs a pass skipped because nothing could be due yet (own: our log's first segment is inside the window or held by the replay floor; dead: every dead log waits for a known time (a retired one for its fence, a pruning one for its next segment to age), live set unchanged); each still runs at least hourly", &["list"]));
 lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retention_ticks_total", "Retention passes by result", &["result"]));
 
 lazy!(PROXY_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_cache_total", "Proxy fast-path cache lookups", &["result"]));
