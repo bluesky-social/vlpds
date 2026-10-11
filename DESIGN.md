@@ -3946,6 +3946,29 @@ tallies and lists each node's config version, error and load times.
 Requests without rate limits (`--no-rate-limits`, non-XRPC paths) are
 unchanged.
 
+## AppView override: runtime config
+
+The AppView override (docs/proxying.md "AppView override",
+`src/appview_override.rs`, `src/xrpc/appview_override.rs`, console page
+"AppView override") moves chosen accounts' calls for chosen `app.bsky.*`
+methods to a second AppView. It reuses the rate-limit config's machinery:
+- `{prefix}/config/appview_override.json` is a versioned object, saved by
+  `vlpds.admin.updateAppviewOverride` with `ifVersion` and an `If-Match`
+  (or create-if-absent) PUT, audited, with the last 50 changes in it.
+- The saving node installs it and POSTs `/internal/v1/appview-override/reload`
+  to every peer. Each node re-reads it every 60 s with `If-None-Match` (a
+  minute, not the rate limits' 10 s: it changes by hand, and the nudge is
+  what makes a save take effect).
+- An object that fails parsing or validation is reported and the node keeps
+  its last good override.
+- Unknown fields are refused on save and dropped on read.
+
+The flags are the boot default. A node runs them until it reads an object,
+and the object wins from then on, whatever the flags say. The routing reads
+an `Arc` behind a lock, skipped through an `AtomicBool` while nothing is in
+force, so a node with no override does no more work per proxied call than
+before.
+
 ## Secrets at rest (`src/secrets.rs`)
 
 Everything durable is in one bucket (and its log segments, SSTs, backups

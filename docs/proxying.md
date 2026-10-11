@@ -187,25 +187,19 @@ and after (a separate run from the ~50 µs throughput bench below).
 
 ## AppView override
 
-| Flag | Environment | Value |
-|---|---|---|
-| `--appview-override` | `VLPDS_APPVIEW_OVERRIDE` | `"<url>,<service did>"`, like `--appview` |
-| `--appview-override-accounts` | `VLPDS_APPVIEW_OVERRIDE_ACCOUNTS` | DIDs, comma-separated. Empty: off |
-| `--appview-override-methods` | `VLPDS_APPVIEW_OVERRIDE_METHODS` | exact `app.bsky.*` NSIDs, comma-separated |
-| `--appview-override-fallback` | `VLPDS_APPVIEW_OVERRIDE_FALLBACK` | `true` (default) or `false` |
-
 The override sends some accounts' AppView calls to a second AppView, for trying one out with a
-real app while everyone else stays on `--appview`. A call moves only when all of these hold:
+real app while everyone else stays on `--appview`. It's set from the console's AppView override
+page, or by flags. A call moves only when all of these hold:
 
 - It would go to the default AppView: no `atproto-proxy` header, or one naming `--appview`'s DID
   with `#bsky_appview`. A header for any other service (chat, a labeler, another AppView) is
   untouched.
-- The token's account is in `--appview-override-accounts`.
-- The method is in `--appview-override-methods`.
+- The token's account is on the override's account list.
+- The method is on its method list.
 
 The method list is an allowlist of exact NSIDs, with no wildcards. A method nobody listed stays on
 the default AppView, and that includes methods Bluesky adds later, suggestions, search and
-`unspecced`. Startup refuses a method outside `app.bsky.*` and the ones this PDS serves itself
+`unspecced`. A method outside `app.bsky.*` is refused, and so are the ones this PDS serves itself
 (`getPreferences`, `putPreferences`, `registerPush`, `unregisterPush`).
 
 A moved call is signed the usual way, with `aud` = the override's DID and `lxm` = the method. That
@@ -216,12 +210,51 @@ Read-after-write merging applies to the override's responses too.
 With the fallback on, a GET the override answers `MethodNotImplemented` (a 501, or a 400 with that
 error name) is sent again to the default AppView. So the override can serve methods one at a time
 without a config change for each. Procedures (POST) are never resent, and any other error is the
-override's answer. Override traffic shows up as `service="appview_override"` in
-`vlpds_upstream_requests_total` and `vlpds_upstream_request_seconds`.
+override's answer.
+
+### Where the config comes from
+
+| Source | Set with | In force |
+|---|---|---|
+| Flags | `--appview-override "<url>,<did>"`, `--appview-override-accounts` (DIDs), `--appview-override-methods` (NSIDs), `--appview-override-fallback` (`true`) | from startup, until a config object exists |
+| Config object | the console, or `vlpds.admin.updateAppviewOverride` | on every node, once it's written: it wins over the flags |
+
+The flags are the boot default (env vars `VLPDS_APPVIEW_OVERRIDE`, `_ACCOUNTS`, `_METHODS`,
+`_FALLBACK`). Startup refuses an incomplete set, and an empty account list is off. The first save
+from the console starts from the flags in force and writes `config/appview_override.json` to the
+bucket. From then on that object is the override on every node, whatever their flags say. Deleting
+it by hand puts each node back on its flags.
+
+The object holds `url`, `did`, `accounts`, `methods`, `fallback` and `enabled` (`false` keeps the
+lists but moves nothing), plus `version`, `updatedAt`, `updatedBy`, `note` and the last 50 changes.
+It's validated like the flags, and every problem is reported with its JSON path. While accounts are
+listed and it's enabled, the URL, the DID and at least one method are required. Unknown fields are
+refused on save, so a typo never silently does nothing. Reading a stored object drops them with a
+warning, since a newer build may have written them. Nodes older than this ignore the object and keep
+their flags until they're upgraded.
+
+Changes work like the [rate-limit config](operations/rate-limits.md):
+
+- `vlpds.admin.updateAppviewOverride {config, ifVersion, actor?, note?}` saves version + 1 with
+  compare-and-swap. A stale `ifVersion` or a lost race is 409 `ConfigConflict`, an invalid config
+  400 `InvalidConfig`. Each save is audited as `appviewOverride.update`.
+- The saving node applies it at once and nudges every peer. Each node also re-reads the object every
+  60 s with `If-None-Match`, one conditional GET per node per minute, so a lost nudge costs at most
+  a minute.
+- An object a node can't accept never takes it down. It keeps its last good config and reports the
+  error (`vlpds_appview_override_config_errors_total`, and per node in the console).
+- `vlpds.admin.getAppviewOverride` returns the object, the flags, what's in force, the default
+  AppView and each node's version, error and traffic. `local=true` skips asking the peers.
+
+Override traffic shows up as `service="appview_override"` in `vlpds_upstream_requests_total` and
+`vlpds_upstream_request_seconds`. Fallbacks are in `vlpds_appview_override_fallbacks_total{status}`,
+by what the override answered, and are also counted in its 4xx or 5xx. The console's page shows
+requests, fallbacks, errors and the time to the response head across the cluster. An account's page
+has a toggle that adds it to the override or takes it off.
 
 The override is operator-configured, so it's trusted like `--appview` and may be a private or
-tailnet address (below). That exemption covers only the configured URL. Nothing in a request can
-point the override anywhere else.
+tailnet address (below). That exemption covers only the configured URL, set by flags or by an admin
+through the console. Nothing in a proxied request can point the override anywhere else.
 
 ## Outbound safety
 
@@ -253,7 +286,7 @@ document, so an attacker gets to pick the endpoint. vlpds treats it that way, as
   fetches `did:web` documents, handle `.well-known` files, OAuth client metadata and lexicons.
 - No client follows redirects, so an allowed host can't bounce a request inward.
 
-The URLs an operator sets (`--appview`, `--appview-override`, `--report-service`) skip these
+The URLs an operator sets (`--appview`, the AppView override, `--report-service`) skip these
 checks, so they can be private or tailnet addresses. That's the only exemption. A request can't
 choose one of them as a URL, only reach them through the routing above.
 

@@ -167,11 +167,12 @@ fn configured<'a>(svc: &'a Option<(String, String)>, service_id: &'static str) -
     })
 }
 
-/// `--appview-override`: `target` itself unless it is the default AppView
-/// and the override names this account and method. The override's URL and
-/// DID come only from config, so it is trusted like `--appview`.
+/// The AppView override (`crate::appview_override`): `target` itself unless
+/// it is the default AppView and the override names this account and
+/// method. The override's URL and DID come only from operator config (flags
+/// or the admin-written bucket object), so it is trusted like `--appview`.
 fn appview_override<'a>(app: &'a App, target: Target<'a>, did: &str, lxm: &str) -> Target<'a> {
-    let Some(o) = app.config.appview_override.as_ref().filter(|o| o.applies(did, lxm)) else {
+    let Some(o) = app.appview_override.active().filter(|o| o.applies(did, lxm)) else {
         return target;
     };
     let default_appview = target.trusted
@@ -181,8 +182,8 @@ fn appview_override<'a>(app: &'a App, target: Target<'a>, did: &str, lxm: &str) 
         return target;
     }
     Target {
-        url: Cow::Borrowed(&o.url),
-        did: Cow::Borrowed(&o.did),
+        url: Cow::Owned(o.url.clone()),
+        did: Cow::Owned(o.did.clone()),
         service_id: Cow::Borrowed("bsky_appview"),
         trusted: true,
         fallback: o.fallback.then(|| Box::new(target)),
@@ -791,9 +792,11 @@ async fn send(
     };
     let again = Forward { method: Method::GET, body: None, accept_encoding: f.accept_encoding.clone(), ..f };
     let (parts, body) = send_to(app, target, f, acct).await?;
+    let status = parts.status;
     if let Some(r) = implemented(parts, body).await {
         return Ok(r);
     }
+    crate::metrics::APPVIEW_OVERRIDE_FALLBACKS.with_label_values(&[status.as_str()]).inc();
     tracing::debug!(lxm = again.lxm, "appview override: method not implemented there, sent to the default");
     send_to(app, default, again, acct).await
 }

@@ -677,6 +677,11 @@ struct OverrideEnv {
 /// Two bulk accounts (their DIDs are known before the server starts), the
 /// first on the override's list.
 async fn spawn_override(methods: &[&str], fallback: bool, dev_mode: bool) -> OverrideEnv {
+    spawn_override_with(methods, fallback, dev_mode, true).await
+}
+
+/// `flags`: the override set by flags (else none until the console saves one).
+async fn spawn_override_with(methods: &[&str], fallback: bool, dev_mode: bool, flags: bool) -> OverrideEnv {
     let (appview, av_url) = spawn_fake().await;
     let (reports, rep_url) = spawn_fake().await;
     let (ov, ov_url) = spawn_fake().await;
@@ -689,14 +694,16 @@ async fn spawn_override(methods: &[&str], fallback: bool, dev_mode: bool) -> Ove
         c.dev_mode = dev_mode;
         c.allow_bulk_create = true;
         c.plc_url = "http://127.0.0.1:1".into();
-        c.appview_override = vlpds::server::AppviewOverride::from_flags(
-            Some((ov_url, OVERRIDE_DID.into())),
-            &[vlpds::state::bulk_did(first)],
-            &methods,
-            fallback,
-            c.appview.as_ref(),
-        )
-        .unwrap();
+        if flags {
+            c.appview_override = vlpds::server::AppviewOverride::from_flags(
+                Some((ov_url, OVERRIDE_DID.into())),
+                &[vlpds::state::bulk_did(first)],
+                &methods,
+                fallback,
+                c.appview.as_ref(),
+            )
+            .unwrap();
+        }
     })
     .await;
     let r = s
@@ -888,4 +895,115 @@ async fn appview_override_without_fallback_answers_as_is() {
     let (s, b) = err_of(o.env.get(Some(&o.listed), "app.bsky.feed.getTimeline").send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str()), (501, Some("MethodNotImplemented")));
     assert_eq!((o.ov.count(), o.env.appview.count()), (1, 0));
+}
+
+// --appview-override from the console: the bucket's config object, live
+
+/// Where `who`'s getTimeline went: "override" or "default".
+async fn timeline_goes(o: &OverrideEnv, who: &TestAccount) -> &'static str {
+    let (n_ov, n_av) = (o.ov.count(), o.env.appview.count());
+    assert_eq!(o.status(who, "app.bsky.feed.getTimeline").await, 200);
+    match (o.ov.count() - n_ov, o.env.appview.count() - n_av) {
+        (1, 0) => "override",
+        (0, 1) => "default",
+        x => panic!("getTimeline went to both or neither: {x:?}"),
+    }
+}
+
+async fn update_override(s: &TestServer, config: J, if_version: u64) -> Resp {
+    let body = json!({"config": config, "ifVersion": if_version, "actor": "tester", "note": "trying it"});
+    s.xrpc.post("vlpds.admin.updateAppviewOverride", &body, &Auth::Admin).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_changes_live_from_the_console() {
+    let o = spawn_override_with(&[], true, false, false).await;
+    let s = &o.env.s;
+    let ov_url = o.ov.base.lock().clone();
+    let key = o.key(&o.listed.did).await;
+
+    // no flags, no object: off
+    let g = s.xrpc.get("vlpds.admin.getAppviewOverride", &[], &Auth::Admin).await.ok();
+    assert_eq!((g["source"].as_str(), g["configVersion"].as_u64()), (Some("flags"), Some(0)));
+    assert!(g["config"].is_null() && g["effective"].is_null() && g["flags"].is_null(), "{g}");
+    assert_eq!(timeline_goes(&o, &o.listed).await, "default");
+
+    // a save routes the listed account's call there at once, no restart
+    let config = json!({
+        "url": ov_url, "did": OVERRIDE_DID, "accounts": [o.listed.did],
+        "methods": ["app.bsky.feed.getTimeline"],
+    });
+    let r = update_override(s, config.clone(), 0).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json["version"], 1);
+    assert_eq!(timeline_goes(&o, &o.listed).await, "override");
+    let claims = verify_service_jwt(&o.ov.last().headers, &key);
+    assert_eq!(
+        (claims["aud"].as_str(), claims["lxm"].as_str()),
+        (Some(OVERRIDE_DID), Some("app.bsky.feed.getTimeline"))
+    );
+    assert_eq!(timeline_goes(&o, &o.other).await, "default");
+
+    // what the console reads: the object, this node on it, the traffic
+    let g = s.xrpc.get("vlpds.admin.getAppviewOverride", &[], &Auth::Admin).await.ok();
+    assert_eq!((g["source"].as_str(), g["configVersion"].as_u64()), (Some("object"), Some(1)));
+    assert_eq!(g["config"]["history"][0]["by"], "tester");
+    assert_eq!(g["effective"]["accounts"], json!([o.listed.did]));
+    assert_eq!(g["nodes"][0]["active"], true);
+    assert!(g["stats"]["ok"].as_u64().unwrap() >= 1, "{g}");
+    let log = s.xrpc.get("vlpds.admin.getAuditLog", &[("limit", "20")], &Auth::Admin).await.ok();
+    let entries = log["entries"].as_array().unwrap();
+    let e = entries.iter().find(|e| e["action"] == "appviewOverride.update").expect("audited");
+    assert_eq!((e["actor"].as_str(), e["detail"]["version"].as_u64()), (Some("tester"), Some(1)));
+
+    // a stale edit is a conflict, and a bad one is refused with its path;
+    // neither changes anything
+    let r = update_override(s, json!({}), 0).await;
+    assert_eq!((r.status, r.json["error"].as_str()), (409, Some("ConfigConflict")), "{}", r.text());
+    let mut bad = config.clone();
+    bad["methods"] = json!(["app.bsky.feed.*", "chat.bsky.convo.listConvos", "app.bsky.actor.getPreferences"]);
+    let r = update_override(s, bad, 1).await;
+    assert_eq!((r.status, r.json["error"].as_str()), (400, Some("InvalidConfig")), "{}", r.text());
+    for want in ["methods[0]", "methods[1]", "methods[2]: app.bsky.actor.getPreferences is served by this PDS"] {
+        assert!(r.json["message"].as_str().unwrap().contains(want), "{want}: {}", r.text());
+    }
+    let r = update_override(s, json!({"url": ov_url, "typo": 1}), 1).await;
+    assert_eq!((r.status, r.json["error"].as_str()), (400, Some("InvalidConfig")), "{}", r.text());
+    assert_eq!(timeline_goes(&o, &o.listed).await, "override");
+
+    // another node's save lands in the bucket: this node's refresher picks it up
+    let mut off = config.clone();
+    off["enabled"] = json!(false);
+    off["version"] = json!(2);
+    use object_store::ObjectStoreExt;
+    let path = vlpds::appview_override::config_path(&s.app.store);
+    s.app.store.raw.put(&path, serde_json::to_vec(&off).unwrap().into()).await.unwrap();
+    s.app.appview_override.wake();
+    let t = std::time::Instant::now();
+    while s.app.appview_override.version() != 2 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "the refresher didn't pick up v2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(timeline_goes(&o, &o.listed).await, "default");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_object_wins_over_flags() {
+    // the flags move getTimeline; the first save starts from them and replaces them
+    let o = spawn_override(&["app.bsky.feed.getTimeline"], true, false).await;
+    let s = &o.env.s;
+    let g = s.xrpc.get("vlpds.admin.getAppviewOverride", &[], &Auth::Admin).await.ok();
+    assert_eq!(g["source"], "flags");
+    assert_eq!(g["flags"]["methods"], json!(["app.bsky.feed.getTimeline"]));
+    assert_eq!(g["effective"], g["flags"]);
+    assert_eq!(timeline_goes(&o, &o.listed).await, "override");
+    let mut cfg = g["flags"].clone();
+    cfg["methods"] = json!(["app.bsky.graph.getFollows"]);
+    let r = update_override(s, cfg, 0).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let changes = r.json["config"]["history"][0]["changes"].clone();
+    assert_eq!(changes, json!(["+method app.bsky.graph.getFollows", "-method app.bsky.feed.getTimeline"]));
+    assert_eq!(timeline_goes(&o, &o.listed).await, "default");
+    let g = s.xrpc.get("vlpds.admin.getAppviewOverride", &[], &Auth::Admin).await.ok();
+    assert_eq!(g["source"], "object");
 }
