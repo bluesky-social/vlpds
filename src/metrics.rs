@@ -220,7 +220,7 @@ lazy!(BLOB_QUOTA_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_bl
 lazy!(BLOB_QUARANTINE: IntCounterVec = register_int_counter_vec!("vlpds_blob_quarantine_total", "Taken-down blobs: quarantined (bytes moved to blob-quarantine/ by a takedown), restored (moved back by a reversal), purged (deleted after --blob-quarantine-days)", &["event"]));
 lazy!(BLOB_UPLOAD_BYTES: IntCounter = register_int_counter!("vlpds_blob_upload_bytes_total", "Bytes of blobs stored by uploadBlob"));
 lazy!(REPORTS: IntCounterVec = register_int_counter_vec!("vlpds_reports_total", "Moderation reports (com.atproto.moderation.createReport) passed on to the moderation service, by result (ok; failed: the service refused it or was unreachable)", &["result"]));
-lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
+lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, appview_override: --appview-override, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
 lazy!(UPSTREAM_DURATION: HistogramVec = register_histogram_vec!("vlpds_upstream_request_seconds", "Proxied request time until the upstream service's response head, by service (unreachable ones included)", &["service"], latency_buckets()));
 lazy!(HANDLE_RESOLUTIONS: IntCounterVec = register_int_counter_vec!("vlpds_handle_resolutions_total", "Custom-domain handle lookups by result (dns: TXT _atproto record; http: /.well-known/atproto-did; not_found: neither answered with a DID)", &["result"]));
 lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (the slot-0 leader's startup/after-activity asks, and vlpds.admin.requestCrawl) by relay and result (ok; rejected: non-2xx answer; failed: unreachable)", &["relay", "result"]));
@@ -284,6 +284,7 @@ pub fn blob_kind(mime: &str) -> &'static str {
 pub fn upstream_service(service_id: &str) -> &'static str {
     match service_id {
         "bsky_appview" => "appview",
+        "appview_override" => "appview_override",
         "bsky_chat" => "chat",
         "atproto_labeler" | "bsky_moderation" => "moderation",
         _ => "other",

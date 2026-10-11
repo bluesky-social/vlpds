@@ -29,6 +29,9 @@ struct Fake {
     /// did:web of this fake (served at /.well-known/did.json).
     did: Arc<Mutex<String>>,
     base: Arc<Mutex<String>>,
+    /// Some(status): `app.bsky.*` calls (but err400) answer that status with
+    /// `MethodNotImplemented`.
+    not_impl: Arc<Mutex<Option<u16>>>,
 }
 
 impl Fake {
@@ -60,6 +63,11 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
         body: body.clone(),
     });
     let json_err = |status: u16, v: J| (StatusCode::from_u16(status).unwrap(), axum::Json(v)).into_response();
+    if let Some(status) = *f.not_impl.lock() {
+        if path.starts_with("/xrpc/app.bsky.") && path != "/xrpc/app.bsky.test.err400" {
+            return json_err(status, json!({"error": "MethodNotImplemented", "message": "not here"}));
+        }
+    }
     match path.as_str() {
         "/xrpc/app.bsky.test.err400" => {
             let mut r = json_err(400, json!({"error": "CustomErr", "message": "boom"}));
@@ -651,4 +659,233 @@ async fn scoped_app_passwords_on_proxied_methods() {
     assert_eq!(err_of(r.send().await.unwrap()).await.0, 403);
     let (s, _) = err_of(chat(&read_only).send().await.unwrap()).await;
     assert!((400..500).contains(&s));
+}
+
+// --appview-override
+
+const OVERRIDE_DID: &str = "did:web:override.test";
+
+struct OverrideEnv {
+    env: Env,
+    /// The override AppView.
+    ov: Fake,
+    /// On the override's account list.
+    listed: TestAccount,
+    other: TestAccount,
+}
+
+/// Two bulk accounts (their DIDs are known before the server starts), the
+/// first on the override's list.
+async fn spawn_override(methods: &[&str], fallback: bool, dev_mode: bool) -> OverrideEnv {
+    let (appview, av_url) = spawn_fake().await;
+    let (reports, rep_url) = spawn_fake().await;
+    let (ov, ov_url) = spawn_fake().await;
+    // the proxy's account cache is per process: no other test's DIDs
+    let first = (1u64 << 40) + 2 * rand::random::<u32>() as u64;
+    let methods: Vec<String> = methods.iter().map(|m| m.to_string()).collect();
+    let s = TestServer::spawn_lone(move |c| {
+        c.appview = Some((av_url, APPVIEW_DID.into()));
+        c.report_service = Some((rep_url, REPORT_DID.into()));
+        c.dev_mode = dev_mode;
+        c.allow_bulk_create = true;
+        c.plc_url = "http://127.0.0.1:1".into();
+        c.appview_override = vlpds::server::AppviewOverride::from_flags(
+            Some((ov_url, OVERRIDE_DID.into())),
+            &[vlpds::state::bulk_did(first)],
+            &methods,
+            fallback,
+            c.appview.as_ref(),
+        )
+        .unwrap();
+    })
+    .await;
+    let r = s
+        .xrpc
+        .post(
+            "vlpds.admin.bulkCreate",
+            &json!({"indices": [first, first + 1], "records": 0, "password": PASSWORD}),
+            &Auth::Bearer(ADMIN_TOKEN.into()),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let mut accts = Vec::new();
+    for i in [first, first + 1] {
+        let did = vlpds::state::bulk_did(i);
+        let v = s
+            .xrpc
+            .post("com.atproto.server.createSession", &json!({"identifier": did, "password": PASSWORD}), &Auth::None)
+            .await
+            .ok();
+        accts.push(TestAccount {
+            did,
+            handle: vlpds::state::bulk_handle(i),
+            password: PASSWORD.into(),
+            email: String::new(),
+            access: v["accessJwt"].as_str().unwrap().into(),
+            refresh: v["refreshJwt"].as_str().unwrap().into(),
+        });
+    }
+    let other = accts.pop().unwrap();
+    let listed = accts.pop().unwrap();
+    OverrideEnv { env: Env { s, appview, reports }, ov, listed, other }
+}
+
+impl OverrideEnv {
+    async fn key(&self, did: &str) -> k256::ecdsa::VerifyingKey {
+        let p = self.env.s.app.partitions.for_key(did).expect("owned");
+        let raw = p.db.get(vlpds::state::account_key(did)).await.unwrap().expect("account");
+        let acct: J = serde_json::from_slice(&raw).unwrap();
+        let pk = acct["signing_pubkey"].as_str().unwrap();
+        decode_k256_multibase(pk.strip_prefix("did:key:").unwrap_or(pk)).unwrap()
+    }
+
+    async fn status(&self, who: &TestAccount, nsid_and_query: &str) -> u16 {
+        self.env.get(Some(who), nsid_and_query).send().await.unwrap().status().as_u16()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_routes_listed_accounts_and_methods() {
+    // outside dev mode: the override's loopback http URL is reachable only
+    // because it is operator-configured
+    let methods = ["app.bsky.feed.getTimeline", "app.bsky.graph.getFollows", "app.bsky.test.echo"];
+    let o = spawn_override(&methods, true, false).await;
+    let (env, ov) = (&o.env, &o.ov);
+    let key = o.key(&o.listed.did).await;
+
+    // a listed account's listed methods go to the override, signed for it
+    for (q, lxm) in [
+        ("app.bsky.feed.getTimeline?limit=3", "app.bsky.feed.getTimeline"),
+        ("app.bsky.graph.getFollows?actor=x", "app.bsky.graph.getFollows"),
+    ] {
+        assert_eq!(o.status(&o.listed, q).await, 200, "{q}");
+        let seen = ov.last();
+        assert_eq!(seen.uri, format!("/xrpc/{q}"));
+        let claims = verify_service_jwt(&seen.headers, &key);
+        assert_eq!(claims["iss"], o.listed.did.as_str());
+        assert_eq!(claims["aud"], OVERRIDE_DID);
+        assert_eq!(claims["lxm"], lxm);
+    }
+    // so does one with a header naming the default AppView
+    let r = env
+        .get(Some(&o.listed), "app.bsky.graph.getFollows?actor=y")
+        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(ov.last().uri, "/xrpc/app.bsky.graph.getFollows?actor=y");
+    // and a procedure on the list, body and all
+    let r = env
+        .post(&o.listed, "app.bsky.test.echo")
+        .header("content-type", "application/x-test")
+        .body(vec![9u8; 1000])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(ov.last().body.len(), 1000);
+    assert_eq!(env.appview.count(), 0, "listed calls reached the default AppView");
+
+    // methods off the list stay on the default AppView
+    let n = ov.count();
+    for q in [
+        "app.bsky.actor.getSuggestions",
+        "app.bsky.graph.getSuggestedFollowsByActor?actor=x",
+        "app.bsky.feed.getSuggestedFeeds",
+        "app.bsky.feed.searchPosts?q=x",
+        "app.bsky.actor.searchActors?q=x",
+        "app.bsky.unspecced.getTrendingTopics",
+        "tools.ozone.moderation.getRepo?did=x",
+    ] {
+        assert_eq!(o.status(&o.listed, q).await, 200, "{q}");
+        let seen = env.appview.last();
+        assert_eq!(seen.uri, format!("/xrpc/{q}"));
+        assert_eq!(verify_service_jwt(&seen.headers, &key)["aud"], APPVIEW_DID);
+    }
+    // and so does every method for an account off the list
+    let other_key = o.key(&o.other.did).await;
+    assert_eq!(o.status(&o.other, "app.bsky.feed.getTimeline").await, 200);
+    let seen = env.appview.last();
+    assert_eq!(seen.uri, "/xrpc/app.bsky.feed.getTimeline");
+    assert_eq!(verify_service_jwt(&seen.headers, &other_key)["aud"], APPVIEW_DID);
+    assert_eq!(ov.count(), n, "an unlisted call reached the override");
+
+    // an explicit header for another service isn't moved, and keeps the SSRF
+    // guard: its loopback did:web isn't even resolved outside dev mode
+    let other_svc = format!("{}#other_svc", env.reports.did.lock().clone());
+    let r = env.get(Some(&o.listed), "app.bsky.feed.getTimeline").header("atproto-proxy", &other_svc);
+    let (s, b) = err_of(r.send().await.unwrap()).await;
+    assert_eq!((s, b["message"].as_str()), (400, Some("could not resolve proxy did")), "{b}");
+    assert_eq!((ov.count(), env.reports.count()), (n, 0));
+
+    // scopes still name the AppView the client asked for
+    let body = json!({"name": "read", "privileged": false,
+        "scopes": format!("atproto rpc:*?aud={APPVIEW_DID}%23bsky_appview")});
+    let pw = env.s.xrpc.post("com.atproto.server.createAppPassword", &body, &o.listed.auth()).await.ok();
+    let read_only = env.session(&o.listed, pw["password"].as_str().unwrap(), json!({})).await;
+    assert_eq!(o.status(&read_only, "app.bsky.feed.getTimeline").await, 200);
+    assert_eq!(ov.count(), n + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_leaves_other_services_alone() {
+    let o = spawn_override(&["app.bsky.feed.getTimeline"], true, true).await;
+    let (env, ov) = (&o.env, &o.ov);
+    let key = o.key(&o.listed.did).await;
+    let other_did = env.reports.did.lock().clone();
+    for lxm in ["app.bsky.feed.getTimeline", "chat.bsky.convo.listConvos"] {
+        let r = env.get(Some(&o.listed), lxm).header("atproto-proxy", format!("{other_did}#other_svc"));
+        assert_eq!(r.send().await.unwrap().status(), 200, "{lxm}");
+        let seen = env.reports.last();
+        assert_eq!(seen.uri, format!("/xrpc/{lxm}"));
+        assert_eq!(verify_service_jwt(&seen.headers, &key)["aud"], other_did.as_str());
+    }
+    // preferences stay local
+    assert_eq!(o.status(&o.listed, "app.bsky.actor.getPreferences").await, 200);
+    assert_eq!((ov.count(), env.appview.count()), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_falls_back_on_method_not_implemented() {
+    let methods = ["app.bsky.feed.getTimeline", "app.bsky.graph.getFollows", "app.bsky.test.echo"];
+    let o = spawn_override(&methods, true, false).await;
+    let (env, ov) = (&o.env, &o.ov);
+    let key = o.key(&o.listed.did).await;
+    for status in [501, 400] {
+        *ov.not_impl.lock() = Some(status);
+        // queries are resent to the default AppView, signed for it
+        for q in ["app.bsky.feed.getTimeline?limit=1", "app.bsky.graph.getFollows?actor=x"] {
+            let (n_ov, n_av) = (ov.count(), env.appview.count());
+            let r = env.get(Some(&o.listed), q).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{status} {q}");
+            let b: J = r.json().await.unwrap();
+            assert_eq!(b["path"], format!("/xrpc/{}", q.split('?').next().unwrap()));
+            assert_eq!((ov.count(), env.appview.count()), (n_ov + 1, n_av + 1), "{status} {q}");
+            let seen = env.appview.last();
+            assert_eq!(seen.uri, format!("/xrpc/{q}"));
+            assert_eq!(verify_service_jwt(&seen.headers, &key)["aud"], APPVIEW_DID);
+        }
+        // procedures never are
+        let n_av = env.appview.count();
+        let r = env.post(&o.listed, "app.bsky.test.echo").body("x").send().await.unwrap();
+        let (s, b) = err_of(r).await;
+        assert_eq!((s, b["error"].as_str()), (status, Some("MethodNotImplemented")));
+        assert_eq!(env.appview.count(), n_av);
+    }
+
+    // any other error is the override's answer
+    let o = spawn_override(&["app.bsky.test.err400"], true, false).await;
+    let (s, b) = err_of(o.env.get(Some(&o.listed), "app.bsky.test.err400").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("CustomErr"), Some("boom")));
+    assert_eq!((o.ov.count(), o.env.appview.count()), (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appview_override_without_fallback_answers_as_is() {
+    let o = spawn_override(&["app.bsky.feed.getTimeline"], false, false).await;
+    *o.ov.not_impl.lock() = Some(501);
+    let (s, b) = err_of(o.env.get(Some(&o.listed), "app.bsky.feed.getTimeline").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (501, Some("MethodNotImplemented")));
+    assert_eq!((o.ov.count(), o.env.appview.count()), (1, 0));
 }

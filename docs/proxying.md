@@ -38,6 +38,7 @@ It's the busiest path a PDS serves, and at Bluesky's scale it uses more CPU than
 | Request | Goes to | Service id |
 |---|---|---|
 | `app.bsky.*`, `tools.ozone.*` without an `atproto-proxy` header | `--appview "<url>,<did>"` | `bsky_appview` |
+| the same, for listed accounts and methods | `--appview-override` ([below](#appview-override)) | `bsky_appview` |
 | `com.atproto.moderation.createReport` | `--report-service "<url>,<did>"` | `atproto_labeler` |
 | `chat.bsky.*` | only where the client names the service in `atproto-proxy` | |
 | any method with `atproto-proxy: <did>#<service>` | that service's endpoint in the DID document | as named |
@@ -184,6 +185,44 @@ is in `vlpds_proxy_read_after_write_total{result}`. On the no-merge path the mea
 nothing above the noise. A laptop A/B at 64 in flight measured ~43 µs CPU per request both before
 and after (a separate run from the ~50 µs throughput bench below).
 
+## AppView override
+
+| Flag | Environment | Value |
+|---|---|---|
+| `--appview-override` | `VLPDS_APPVIEW_OVERRIDE` | `"<url>,<service did>"`, like `--appview` |
+| `--appview-override-accounts` | `VLPDS_APPVIEW_OVERRIDE_ACCOUNTS` | DIDs, comma-separated. Empty: off |
+| `--appview-override-methods` | `VLPDS_APPVIEW_OVERRIDE_METHODS` | exact `app.bsky.*` NSIDs, comma-separated |
+| `--appview-override-fallback` | `VLPDS_APPVIEW_OVERRIDE_FALLBACK` | `true` (default) or `false` |
+
+The override sends some accounts' AppView calls to a second AppView, for trying one out with a
+real app while everyone else stays on `--appview`. A call moves only when all of these hold:
+
+- It would go to the default AppView: no `atproto-proxy` header, or one naming `--appview`'s DID
+  with `#bsky_appview`. A header for any other service (chat, a labeler, another AppView) is
+  untouched.
+- The token's account is in `--appview-override-accounts`.
+- The method is in `--appview-override-methods`.
+
+The method list is an allowlist of exact NSIDs, with no wildcards. A method nobody listed stays on
+the default AppView, and that includes methods Bluesky adds later, suggestions, search and
+`unspecced`. Startup refuses a method outside `app.bsky.*` and the ones this PDS serves itself
+(`getPreferences`, `putPreferences`, `registerPush`, `unregisterPush`).
+
+A moved call is signed the usual way, with `aud` = the override's DID and `lxm` = the method. That
+DID is used as configured and never resolved. OAuth and app-password scopes are checked against the
+AppView the client named, so a token scoped to `did:web:api.bsky.app#bsky_appview` keeps working.
+Read-after-write merging applies to the override's responses too.
+
+With the fallback on, a GET the override answers `MethodNotImplemented` (a 501, or a 400 with that
+error name) is sent again to the default AppView. So the override can serve methods one at a time
+without a config change for each. Procedures (POST) are never resent, and any other error is the
+override's answer. Override traffic shows up as `service="appview_override"` in
+`vlpds_upstream_requests_total` and `vlpds_upstream_request_seconds`.
+
+The override is operator-configured, so it's trusted like `--appview` and may be a private or
+tailnet address (below). That exemption covers only the configured URL. Nothing in a request can
+point the override anywhere else.
+
 ## Outbound safety
 
 ```diagram
@@ -213,6 +252,10 @@ document, so an attacker gets to pick the endpoint. vlpds treats it that way, as
   vlpds never connects to a name that resolves to `10.x`, `169.254.x` or loopback. The same client
   fetches `did:web` documents, handle `.well-known` files, OAuth client metadata and lexicons.
 - No client follows redirects, so an allowed host can't bounce a request inward.
+
+The URLs an operator sets (`--appview`, `--appview-override`, `--report-service`) skip these
+checks, so they can be private or tailnet addresses. That's the only exemption. A request can't
+choose one of them as a URL, only reach them through the routing above.
 
 A refused endpoint answers 502 "Upstream service unreachable" and logs the reason. `--dev-mode`
 lifts these checks so local stacks work. Never run production in dev mode. The reference's SSRF

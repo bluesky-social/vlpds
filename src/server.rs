@@ -10,6 +10,85 @@ use std::time::Duration;
 use vlsync_firehose::firehose::Firehose;
 use vlsync_store::store::{S3Config, Store};
 
+/// A second AppView for chosen accounts and methods (`--appview-override`;
+/// docs/proxying.md "AppView override"). It applies only to calls that would
+/// go to the default AppView, so `--appview` must be set.
+#[derive(Clone, Debug)]
+pub struct AppviewOverride {
+    /// Operator-configured, so trusted like `--appview`'s: it may be private.
+    pub url: String,
+    /// The service-auth audience, never resolved.
+    pub did: String,
+    pub accounts: std::collections::HashSet<String>,
+    /// Exact `app.bsky.*` NSIDs: an allowlist, so a method the override
+    /// hasn't been told about (a new one, suggestions, search) stays on the
+    /// default.
+    pub methods: std::collections::HashSet<String>,
+    /// A GET it answers `MethodNotImplemented` (501, or 400 with that error)
+    /// is sent to the default AppView.
+    pub fallback: bool,
+}
+
+/// Served by this PDS, never proxied, so an override can't name them.
+const LOCAL_APPVIEW_METHODS: &[&str] = &[
+    "app.bsky.actor.getPreferences",
+    "app.bsky.actor.putPreferences",
+    "app.bsky.notification.registerPush",
+    "app.bsky.notification.unregisterPush",
+];
+
+impl AppviewOverride {
+    /// None when `url` is unset or `accounts` is empty (off).
+    pub fn from_flags(
+        url_did: Option<(String, String)>,
+        accounts: &[String],
+        methods: &[String],
+        fallback: bool,
+        appview: Option<&(String, String)>,
+    ) -> anyhow::Result<Option<AppviewOverride>> {
+        let set = |v: &[String]| -> std::collections::HashSet<String> {
+            v.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect()
+        };
+        let (accounts, methods) = (set(accounts), set(methods));
+        let Some((url, did)) = url_did else {
+            anyhow::ensure!(
+                accounts.is_empty() && methods.is_empty(),
+                "--appview-override-accounts/-methods need --appview-override"
+            );
+            return Ok(None);
+        };
+        if accounts.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(appview.is_some(), "--appview-override needs --appview (the default AppView)");
+        let u = reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("--appview-override url {url}: {e}"))?;
+        anyhow::ensure!(
+            matches!(u.scheme(), "http" | "https") && u.host_str().is_some(),
+            "--appview-override url must be http(s)://host[:port]: {url}"
+        );
+        anyhow::ensure!(vlatproto::syntax::valid_did(&did), "--appview-override: invalid service DID {did}");
+        if let Some(bad) = accounts.iter().find(|d| !vlatproto::syntax::valid_did(d)) {
+            anyhow::bail!("--appview-override-accounts: invalid DID {bad}");
+        }
+        anyhow::ensure!(!methods.is_empty(), "--appview-override needs --appview-override-methods");
+        for m in &methods {
+            anyhow::ensure!(
+                m.starts_with("app.bsky.") && vlatproto::syntax::valid_nsid(m),
+                "--appview-override-methods: {m} is not an app.bsky.* NSID"
+            );
+            anyhow::ensure!(
+                !LOCAL_APPVIEW_METHODS.contains(&m.as_str()),
+                "--appview-override-methods: {m} is served by this PDS, never proxied"
+            );
+        }
+        Ok(Some(AppviewOverride { url, did, accounts, methods, fallback }))
+    }
+
+    pub fn applies(&self, did: &str, lxm: &str) -> bool {
+        self.accounts.contains(did) && self.methods.contains(lxm)
+    }
+}
+
 /// No Debug: it holds secrets (tokens, S3/SMTP credentials, KEK config).
 #[derive(Clone)]
 pub struct Config {
@@ -66,6 +145,9 @@ pub struct Config {
     pub disk_cache_shard_bytes: Option<u64>,
     /// (url, service DID)
     pub appview: Option<(String, String)>,
+    /// Some accounts' AppView calls for some methods go here instead of
+    /// `appview` ([`AppviewOverride`]).
+    pub appview_override: Option<AppviewOverride>,
     /// (url, service DID)
     pub report_service: Option<(String, String)>,
     /// None: the PDS's own getBlob URL.
@@ -299,6 +381,7 @@ impl Default for Config {
             disk_cache_bytes: None,
             disk_cache_shard_bytes: None,
             appview: None,
+            appview_override: None,
             report_service: None,
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
@@ -1280,6 +1363,55 @@ pub async fn shutdown(app: &Arc<xrpc::App>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appview_override_flags() {
+        let av = ("https://api.bsky.app".to_string(), "did:web:api.bsky.app".to_string());
+        let ov = || Some(("http://appview.internal:2584".to_string(), "did:web:appview2.example".to_string()));
+        let me = vec!["did:plc:ewvi7nxzyoun6zhxrhs64oiz".to_string()];
+        let methods = vec!["app.bsky.feed.getTimeline".to_string(), " app.bsky.actor.getProfile ".to_string()];
+        let none: Vec<String> = Vec::new();
+        let blank = vec![String::new()];
+        fn parse(
+            ov: Option<(String, String)>,
+            accounts: &[String],
+            methods: &[String],
+            appview: Option<&(String, String)>,
+        ) -> anyhow::Result<Option<AppviewOverride>> {
+            AppviewOverride::from_flags(ov, accounts, methods, true, appview)
+        }
+
+        // off: the default config, an unset URL, or no accounts
+        assert!(Config::default().appview_override.is_none());
+        assert!(parse(None, &none, &none, Some(&av)).unwrap().is_none());
+        assert!(parse(None, &blank, &blank, Some(&av)).unwrap().is_none());
+        assert!(parse(ov(), &none, &methods, Some(&av)).unwrap().is_none());
+
+        let o = parse(ov(), &me, &methods, Some(&av)).unwrap().unwrap();
+        assert!(o.applies(&me[0], "app.bsky.actor.getProfile"));
+        assert!(!o.applies(&me[0], "app.bsky.actor.getSuggestions"));
+        assert!(!o.applies("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "app.bsky.feed.getTimeline"));
+
+        fn refused(
+            ov: Option<(String, String)>,
+            accounts: &[String],
+            methods: &[&str],
+            appview: Option<&(String, String)>,
+        ) -> String {
+            let methods: Vec<String> = methods.iter().map(|m| m.to_string()).collect();
+            parse(ov, accounts, &methods, appview).unwrap_err().to_string()
+        }
+        assert!(refused(None, &me, &[], Some(&av)).contains("need --appview-override"));
+        assert!(refused(ov(), &me, &["app.bsky.feed.getTimeline"], None).contains("needs --appview"));
+        assert!(refused(ov(), &me, &[], Some(&av)).contains("--appview-override-methods"));
+        for m in ["chat.bsky.convo.listConvos", "tools.ozone.moderation.getRepo", "app.bsky.feed.*"] {
+            assert!(refused(ov(), &me, &[m], Some(&av)).contains("not an app.bsky.* NSID"), "{m}");
+        }
+        assert!(refused(ov(), &me, &["app.bsky.actor.getPreferences"], Some(&av)).contains("served by this PDS"));
+        assert!(refused(ov(), &["alice".into()], &["app.bsky.feed.getTimeline"], Some(&av)).contains("invalid DID"));
+        let bad_url = Some(("appview2:2584".to_string(), "did:web:appview2.example".to_string()));
+        assert!(refused(bad_url, &me, &["app.bsky.feed.getTimeline"], Some(&av)).contains("http(s)"));
+    }
 
     #[test]
     fn secrets_fail_closed_outside_dev_mode() {
