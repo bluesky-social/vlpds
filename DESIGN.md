@@ -5533,7 +5533,9 @@ one domain can't multiply what a write sends one machine. Sends go through the p
 client. Lanes are best effort and in memory. When a shard opens, each of
 its spaces with a live registration sends one forward of its newest writer,
 naming its true predecessor from `sQ`, so a syncer that missed one sees the gap and
-pulls `listRepos`. A taken-down space forwards nothing.
+pulls `listRepos`. The shard takes writes meanwhile, so the dispatcher drops a catch-up
+that a newer sequenced write has passed: it would reach the syncer after that write's
+forward. A taken-down space forwards nothing.
 
 ### Revocations, retention and operator reads
 
