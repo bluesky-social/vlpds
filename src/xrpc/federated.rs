@@ -1143,19 +1143,23 @@ async fn signup_post(
         email_confirmed,
         ..Default::default()
     };
-    match take_signup_slot(&app, &p).await {
-        Ok(true) => {}
-        Ok(false) => {
+    let slot = match take_signup_slot(&app, &p).await {
+        Ok(Slot::Full) => {
             let msg = format!("No more accounts can be created with {} today. Please try again tomorrow.", p.name);
             return again(msg, StatusCode::TOO_MANY_REQUESTS).await;
         }
+        Ok(slot) => slot,
         Err(e) => return page(&app, e.status, &e.message),
-    }
+    };
     let acct = match super::server::create_account_inner(&app, inp, None).await {
         Ok(a) => a,
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => return again(e.message, e.status).await,
         Err(e) if e.status.is_server_error() => return page(&app, e.status, &e.message),
-        Err(e) => return again(e.message, StatusCode::BAD_REQUEST).await,
+        Err(e) => {
+            // refused before any account existed (a taken handle, a bad invite): the user retries
+            give_back_signup_slot(&app, &p.id, slot).await;
+            return again(e.message, StatusCode::BAD_REQUEST).await;
+        }
     };
     let _ = app.private_cas(&routing, vec![Cond::eq(STATE_ROW, Some(raw))], vec![Op::put(STATE_ROW, None)]).await;
     crate::metrics::FEDERATED_IDENTITIES.with_label_values(&["linked"]).inc();
@@ -1170,11 +1174,19 @@ async fn signup_post(
     super::oauth::federated_signed_up(&app, &headers, st.request_id.as_deref(), &acct.did, epoch, cred, st.app).await
 }
 
+#[derive(Clone, Copy)]
+enum Slot {
+    Uncapped,
+    /// Counted against this UTC day.
+    Taken(u64),
+    Full,
+}
+
 /// One of the provider's signups today (UTC), counted cluster-wide in a
-/// private row the GC drops after two days. False: today's are gone.
-async fn take_signup_slot(app: &App, p: &Provider) -> XResult<bool> {
+/// private row the GC drops after two days.
+async fn take_signup_slot(app: &App, p: &Provider) -> XResult<Slot> {
     if p.signups_per_day == 0 {
-        return Ok(true);
+        return Ok(Slot::Uncapped);
     }
     let day = super::server::now_secs() / 86_400;
     let routing = signup_count_routing(&p.id, day);
@@ -1182,15 +1194,35 @@ async fn take_signup_slot(app: &App, p: &Provider) -> XResult<bool> {
         let raw = app.get_private(&routing, SIGNUP_COUNT_ROW).await?;
         let n: u32 = raw.as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(0);
         if n >= p.signups_per_day {
-            return Ok(false);
+            return Ok(Slot::Full);
         }
         let val = Bytes::from(super::server::to_json_bytes(&(n + 1)));
         let op = Op::put(SIGNUP_COUNT_ROW, Some(val));
         if app.private_cas(&routing, vec![Cond::eq(SIGNUP_COUNT_ROW, raw)], vec![op]).await?.applied {
-            return Ok(true);
+            return Ok(Slot::Taken(day));
         }
     }
     Err(super::server::cas_conflict())
+}
+
+/// Best effort: a lost race or a store error leaves the slot used.
+async fn give_back_signup_slot(app: &App, provider: &str, slot: Slot) {
+    let Slot::Taken(day) = slot else { return };
+    let routing = signup_count_routing(provider, day);
+    for _ in 0..CAS_ROUNDS {
+        let Ok(raw) = app.get_private(&routing, SIGNUP_COUNT_ROW).await else { return };
+        let n: u32 = raw.as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        let val = Bytes::from(super::server::to_json_bytes(&(n - 1)));
+        let op = Op::put(SIGNUP_COUNT_ROW, Some(val));
+        match app.private_cas(&routing, vec![Cond::eq(SIGNUP_COUNT_ROW, raw)], vec![op]).await {
+            Ok(o) if o.applied => return,
+            Ok(_) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 pub const SIGNUP_COUNT_ROW: &str = "fedsignup/n";

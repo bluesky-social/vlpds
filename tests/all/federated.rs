@@ -1322,6 +1322,11 @@ async fn signups_per_provider_are_capped_per_day() {
         let start = href(&html, "/oauth/federated/start?provider=").unwrap();
         let (_, _, form) = through_idp(&s, &mut b, &start).await;
         let handle = format!("cap{}", rand::random::<u32>() % 100000);
+        if i == 0 {
+            // a refused form doesn't use up the day's only signup
+            let (st, _, body) = post_signup(&s, &mut b, &form, "a", &format!("{sub}@example.com"), "").await;
+            assert_eq!(st, 400, "{body}");
+        }
         let (st, _, body) = post_signup(&s, &mut b, &form, &handle, &format!("{sub}@example.com"), "").await;
         match i {
             0 => assert_eq!(st, 303, "{body}"),
