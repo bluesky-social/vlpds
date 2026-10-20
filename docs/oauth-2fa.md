@@ -59,6 +59,9 @@ edges:
 | Second factor | on the sign-in page, unless the browser is [trusted](#trusted-browsers) · a [passkey](#passkeys) can replace the password | `authFactorToken`, unless the account page's browser is trusted · refused with `PasskeyRequired` when a passkey is the only strong factor | skipped, as in the reference |
 | Revoked by | `/oauth/revoke`, the account page, any revoke-all | `deleteSession`, any revoke-all | `revokeAppPassword`, any revoke-all |
 
+An operator can also add third-party sign-in (Google, Apple, a company identity provider, an adapter) as a way past the
+password step. The second factors still apply. See [Sign-in providers](operations/sign-in-providers.md).
+
 App passwords are server-generated (~80 bits) and stored as SHA-256 hashes. They can't change the account's
 handle or identity, because `updateHandle` and `submitPlcOperation` refuse them. That's stricter than the
 reference. Other services get short-lived **service-auth JWTs** signed with the account's repo key
