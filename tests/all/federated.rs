@@ -986,3 +986,283 @@ async fn a_link_asks_for_an_account_and_its_token_expires() {
     assert!(mail.contains("with Example (person@example.com)"), "{mail}");
     let _ = idp;
 }
+
+// ---------------------------------------------------------------- P2: signup and the account page app
+
+/// The signup form's fields from its page.
+fn signup_fields(html: &str) -> (String, String) {
+    (hidden_field(html, "ticket").expect("ticket"), csrf_of(html))
+}
+
+async fn post_signup(s: &Srv, b: &mut Browser, html: &str, handle: &str, email: &str, invite: &str) -> Page {
+    let (ticket, csrf) = signup_fields(html);
+    b.post(
+        s,
+        "/oauth/federated/signup",
+        &[
+            ("ticket", &ticket),
+            ("csrf", &csrf),
+            ("handle", handle),
+            ("email", email),
+            ("invite_code", invite),
+            ("action", "sign-up"),
+        ],
+    )
+    .await
+}
+
+async fn session_of(s: &Srv, key: &DpopKey, t: &Tokens) -> J {
+    let r = xrpc_dpop(s, key, &t.access, "GET", "com.atproto.server.getSession", None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signup_with_a_provider_on_the_oauth_page() {
+    let s = spawn().await;
+    let idp = Idp::start().await;
+    add_provider(&s, &idp, "example", json!({"signup": "open", "trustEmail": true})).await;
+    idp.state.lock().email = Some("newcomer@example.com".into());
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto transition:email", &key);
+    let p = pkce();
+    let mut b = Browser::default();
+    let (ru, (st, _, html)) = oauth_via_provider(&s, &mut b, &f, &p).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Create an account") && html.contains("newcomer@example.com"), "{html}");
+    // the OAuth request lives as long as the signup ticket
+    let rid = vlpds::oauth::store::request_id_from_uri(&ru).unwrap().to_string();
+    let req = vlpds::oauth::store::get_request(&s.app, &rid).await.unwrap().unwrap();
+    assert!(req.expires_at - chrono::Utc::now().timestamp() > 14 * 60, "{}", req.expires_at);
+    assert!(html.contains("Already confirmed") && !html.contains("name=\"password\""), "{html}");
+    // another browser can't use the ticket
+    let (st, _, other) = post_signup(&s, &mut Browser::default(), &html, "intruder1", "x@example.com", "").await;
+    assert_eq!(st, 400, "{other}");
+    // a taken handle: the same ticket again with another
+    let taken = create_account(&s, "taken").await;
+    let first_label = taken.handle.split('.').next().unwrap().to_string();
+    let (st, _, again) = post_signup(&s, &mut b, &html, &first_label, "newcomer@example.com", "").await;
+    assert_eq!(st, 400, "{again}");
+    assert!(again.contains("already taken") || again.contains("Handle"), "{again}");
+    let handle = format!("nc{}", rand::random::<u32>() % 100000);
+    let (st, _, consent) = post_signup(&s, &mut b, &again, &handle, "newcomer@example.com", "").await;
+    assert_eq!(st, 200, "{consent}");
+    let did = hidden_field(&consent, "did").expect("consent names the new account");
+    let t = consent_and_token(&s, &mut b, &f, &p, &ru, &consent, &did).await;
+    let sess = session_of(&s, &key, &t).await;
+    assert_eq!((&sess["did"], &sess["emailConfirmed"]), (&json!(did), &json!(true)), "{sess}");
+    // the ticket is spent
+    let (st, _, _) = post_signup(&s, &mut b, &again, "another1", "newcomer@example.com", "").await;
+    assert_eq!(st, 400);
+    // no password: createSession never works, the provider does
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.base))
+        .json(&json!({"identifier": format!("{handle}.vlpds.test"), "password": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert!(signed_in(&account_page_sign_in(&s).await));
+    // the identity is its only way in: unlinking it is refused
+    let mut b2 = Browser::default();
+    let (_, _, html) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let start = href(&html, "/oauth/federated/start?provider=").unwrap();
+    assert!(signed_in(&through_idp(&s, &mut b2, &start).await));
+    let (_, _, html) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let r = hidden_field(&html, "ref").expect("a Remove form");
+    let (_, h, _) =
+        b2.post(&s, "/oauth/account/unlink", &[("csrf", &csrf_of(&html)), ("did", &did), ("ref", &r)]).await;
+    assert_eq!(location(&h), "/oauth/account?notice=last");
+    // the email reset sets a password; then the identity may go
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.requestPasswordReset", s.base))
+        .json(&json!({"email": "newcomer@example.com"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let tok = dev_mail_token(&s, "newcomer@example.com", "reset_password").await;
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.resetPassword", s.base))
+        .json(&json!({"token": tok, "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.base))
+        .json(&json!({"identifier": format!("{handle}.vlpds.test"), "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    // the reset signed everything out, so sign in again before changing methods
+    let acct = Account { did: did.clone(), handle: format!("{handle}.vlpds.test"), jwt: String::new() };
+    let mut b3 = Browser::default();
+    device_sign_in(&s, &mut b3, &acct).await;
+    let (_, _, html) = b3.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let r = hidden_field(&html, "ref").unwrap();
+    let (_, h, _) =
+        b3.post(&s, "/oauth/account/unlink", &[("csrf", &csrf_of(&html)), ("did", &did), ("ref", &r)]).await;
+    assert_eq!(location(&h), "/oauth/account?notice=unlinked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signup_policies_and_unverified_email() {
+    let s = spawn().await;
+    let idp = Idp::start().await;
+    add_provider(&s, &idp, "example", json!({"signup": "invite"})).await;
+    idp.state.lock().email = Some("invited@example.com".into());
+    let mut b = Browser::default();
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let start = href(&html, "/oauth/federated/start?provider=").unwrap();
+    let (st, _, form) = through_idp(&s, &mut b, &start).await;
+    assert_eq!(st, 200, "{form}");
+    assert!(form.contains("name=\"invite_code\"") && !form.contains("Already confirmed"), "{form}");
+    let handle = format!("inv{}", rand::random::<u32>() % 100000);
+    let (st, _, again) = post_signup(&s, &mut b, &form, &handle, "invited@example.com", "").await;
+    assert_eq!(st, 400, "{again}");
+    assert!(again.contains("invite code is required"), "{again}");
+    let (st, _, again) = post_signup(&s, &mut b, &again, &handle, "invited@example.com", "nope-nope").await;
+    assert_eq!(st, 400, "{again}");
+    let (_, code) = admin_post(&s, "com.atproto.server.createInviteCode", json!({"useCount": 1})).await;
+    let code = code["code"].as_str().unwrap().to_string();
+    let (st, h, body) = post_signup(&s, &mut b, &again, &handle, "invited@example.com", &code).await;
+    assert_eq!((st, location(&h)), (303, "/oauth/account".to_string()), "{body}");
+    // without trustEmail the address isn't confirmed
+    let did = s.app.resolve_handle(&format!("{handle}.vlpds.test")).await.ok().flatten().unwrap();
+    assert!(!s.app.account(&did).await.ok().unwrap().email_confirmed);
+    // signup off: the unknown identity is just unknown
+    add_provider(&s, &idp, "example", json!({"signup": "off"})).await;
+    idp.state.lock().sub = "user-2".into();
+    assert_eq!(location(&account_page_sign_in(&s).await.1), "/oauth/account?add=1&error=unknown_identity");
+}
+
+/// The account page app's provider sign-in: the server pages do it, then
+/// the app trades it once for a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_account_page_app_gets_a_session_once() {
+    let Setup { s, idp, acct } = setup(json!({})).await;
+    link(&s, &mut Browser::default(), &acct).await;
+    let trade = |b: &Browser, same_origin: bool| {
+        let mut rb = s.http.post(format!("{}/xrpc/vlpds.server.createFederatedSession", s.base));
+        if let Some(c) = &b.cookie {
+            rb = rb.header("cookie", c);
+        }
+        if same_origin {
+            rb = rb.header("sec-fetch-site", "same-origin");
+        }
+        rb.send()
+    };
+    let mut b = Browser::default();
+    let (_, _, _) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let p = through_idp(&s, &mut b, "/oauth/federated/start?provider=example&account=1&app=1").await;
+    assert_eq!((p.0, location(&p.1)), (303, "/account?signin=device".to_string()));
+    assert_eq!(trade(&b, false).await.unwrap().status().as_u16(), 401, "same-origin only");
+    // two pickups at once: one session
+    let (r1, r2) = tokio::join!(trade(&b, true), trade(&b, true));
+    let (r1, r2) = (r1.unwrap(), r2.unwrap());
+    let mut codes = [r1.status().as_u16(), r2.status().as_u16()];
+    codes.sort();
+    assert_eq!(codes, [200, 401], "one of two concurrent pickups");
+    let r = if r1.status().as_u16() == 200 { r1 } else { r2 };
+    let j: J = r.json().await.unwrap();
+    assert_eq!(j["did"], json!(acct.did));
+    let (st, me) = s.bearer(j["accessJwt"].as_str().unwrap(), "com.atproto.server.getSession", false, None).await;
+    assert_eq!((st, &me["did"]), (200, &json!(acct.did)));
+    assert_eq!(trade(&b, true).await.unwrap().status().as_u16(), 401, "once");
+    // with TOTP the second step happens on the server page first
+    let (secret, step) = enable_totp(&s, &acct).await;
+    let mut b = Browser::default();
+    let _ = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let p = through_idp(&s, &mut b, "/oauth/federated/start?provider=example&account=1&app=1").await;
+    assert_eq!(location(&p.1), "/oauth/account?add=1&2fa=1");
+    assert_eq!(trade(&b, true).await.unwrap().status().as_u16(), 401, "nothing to trade before the code");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&2fa=1", s.base)).await;
+    let code = vlpds::totp::code_for_step(&secret, step + 1);
+    let (st, h, body) = b
+        .post(
+            &s,
+            "/oauth/account/sign-in",
+            &[("csrf", &csrf_of(&html)), ("step", "2fa"), ("code", &code), ("action", "sign-in")],
+        )
+        .await;
+    assert_eq!((st, location(&h)), (303, "/account?signin=device".to_string()), "{body}");
+    let r = trade(&b, true).await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = idp;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_password_is_no_password() {
+    let s = spawn().await;
+    for pw in ["", "   "] {
+        let r = s
+            .http
+            .post(format!("{}/xrpc/com.atproto.server.createAccount", s.base))
+            .json(&json!({"handle": format!("np{}.vlpds.test", rand::random::<u32>() % 100000), "password": pw,
+                          "email": format!("np{}@example.com", rand::random::<u32>())}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "{pw:?}");
+        let j: J = r.json().await.unwrap();
+        assert_eq!(j["message"], "Password is required", "{j}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dormant_identity_is_no_way_in() {
+    let Setup { s, idp, acct } = setup(json!({})).await;
+    let mut b = Browser::default();
+    link(&s, &mut b, &acct).await;
+    let other = Idp::start().await;
+    add_provider(&s, &other, "second", json!({})).await;
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let add = href(&html, "/oauth/federated/start?provider=second").unwrap();
+    assert_eq!(location(&through_idp(&s, &mut b, &add).await.1), "/oauth/account?notice=linked");
+    let (st, _) = admin_post(&s, "vlpds.admin.removeSignInProvider", json!({"id": "second"})).await;
+    assert_eq!(st, 200);
+    s.app
+        .mutate_account(&acct.did, false, false, false, |a| {
+            a.password_hash = String::new();
+            Ok(true)
+        })
+        .await
+        .ok()
+        .unwrap();
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let live = vlpds::federated::auth_ref(&idp.issuer, "user-1");
+    let (_, h, _) =
+        b.post(&s, "/oauth/account/unlink", &[("csrf", &csrf_of(&html)), ("did", &acct.did), ("ref", &live)]).await;
+    assert_eq!(location(&h), "/oauth/account?notice=last", "the dormant identity can't sign in, so the live one stays");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signups_per_provider_are_capped_per_day() {
+    let s = spawn().await;
+    let idp = Idp::start().await;
+    add_provider(&s, &idp, "example", json!({"signup": "open", "signupsPerDay": 1})).await;
+    let (_, list) = admin_get(&s, "vlpds.admin.listSignInProviders").await;
+    assert_eq!(list["providers"][0]["signupsPerDay"], 1);
+    for (i, sub) in ["first", "second"].into_iter().enumerate() {
+        idp.state.lock().sub = sub.into();
+        let mut b = Browser::default();
+        let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+        let start = href(&html, "/oauth/federated/start?provider=").unwrap();
+        let (_, _, form) = through_idp(&s, &mut b, &start).await;
+        let handle = format!("cap{}", rand::random::<u32>() % 100000);
+        let (st, _, body) = post_signup(&s, &mut b, &form, &handle, &format!("{sub}@example.com"), "").await;
+        match i {
+            0 => assert_eq!(st, 303, "{body}"),
+            _ => {
+                assert_eq!(st, 429, "{body}");
+                assert!(body.contains("today"), "{body}");
+            }
+        }
+    }
+}

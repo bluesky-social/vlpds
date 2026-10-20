@@ -18,6 +18,7 @@
       ],
       "responseMode": "query",
       "signup": "off",
+      "signupsPerDay": 25,
       "trustEmail": true,
       "requiredClaims": {
         "hd": "example.com"
@@ -51,6 +52,7 @@
       ],
       "responseMode": "query",
       "signup": "off",
+      "signupsPerDay": 25,
       "trustEmail": true,
       "requiredClaims": {
         "hd": "example.com"
@@ -80,6 +82,7 @@
       ],
       "responseMode": "query",
       "signup": "off",
+      "signupsPerDay": 25,
       "trustEmail": true,
       "requiredClaims": {
         "hd": "example.com"

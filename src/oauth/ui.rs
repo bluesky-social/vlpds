@@ -524,6 +524,67 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
     page("Create an account", &b)
 }
 
+/// Account creation with a sign-in provider's identity: no password.
+pub struct FederatedSignup<'a> {
+    pub ticket: &'a str,
+    pub csrf: &'a str,
+    pub provider: &'a str,
+    pub form: SignupForm<'a>,
+    /// The provider vouched for the address it gave.
+    pub email_verified: bool,
+}
+
+pub fn federated_signup(ctx: Option<&Ctx>, f: &FederatedSignup) -> String {
+    let s = &f.form;
+    let mut b = match ctx {
+        Some(c) => format!(
+            "<h1>Create an account on {}</h1><p class=\"muted\">with {}, to continue to</p>{}",
+            e(c.server_name),
+            e(f.provider),
+            client_block(c)
+        ),
+        None => format!("<h1>Create an account</h1><p class=\"muted\">with {}</p>", e(f.provider)),
+    };
+    b.push_str(&format!(
+        "<p>No account here uses this {} sign-in yet. Pick a handle to create one, or <a href=\"/oauth/account?add=1\">sign in another way</a> and add it to your account.</p>",
+        e(f.provider)
+    ));
+    if let Some(err) = s.error {
+        b.push_str(&format!("<p class=\"err\" role=\"alert\">{}</p>", e(err)));
+    }
+    b.push_str(&format!(
+        "<form method=\"post\" action=\"/oauth/federated/signup\"><input type=\"hidden\" name=\"ticket\" value=\"{}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+<label for=\"handle\">Handle</label>\
+<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus>{}</div>\
+<p class=\"hint\">3 to 18 letters, digits or hyphens. You can switch to your own domain later.</p>\
+<label for=\"email\">Email</label>\
+<input type=\"email\" id=\"email\" name=\"email\" value=\"{}\" autocomplete=\"email\" required>\
+<p class=\"hint\">{}</p>",
+        e(f.ticket),
+        e(f.csrf),
+        e(s.handle),
+        domain_affix(s),
+        e(s.email),
+        if f.email_verified {
+            "Already confirmed by your sign-in. Change it and you'll confirm the new one by email."
+        } else {
+            "Required: the server sends account and security mail here."
+        }
+    ));
+    if s.invite_required {
+        b.push_str(&format!(
+            "<label for=\"invite\">Invite code</label>\
+<input type=\"text\" id=\"invite\" name=\"invite_code\" value=\"{}\" autocapitalize=\"none\" spellcheck=\"false\" required>",
+            e(s.invite_code)
+        ));
+    }
+    b.push_str(
+        "<div class=\"row\"><button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-up\">Create account</button>\
+<button type=\"submit\" class=\"back\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button></div></form>",
+    );
+    page("Create an account", &b)
+}
+
 pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {
     let mut b = format!("<h1>Choose an account</h1><p class=\"muted\">to continue to</p>{}", client_block(ctx));
     for (did, handle) in accounts {

@@ -20,6 +20,16 @@
     "value": "{\"provider\":\"wallet\",\"purpose\":\"link\",\"did\":\"did:plc:fixture0000000000000000\",\"deviceId\":\"dev-fixture\",\"createdAt\":1790000000,\"expiresAt\":1790000600}"
   },
   {
+    "name": "oauth/fed",
+    "routing": "oauth:fed:st3aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "value": "{\"provider\":\"example\",\"purpose\":\"signup\",\"deviceId\":\"dev-fixture\",\"createdAt\":1790000000,\"expiresAt\":1790000900,\"app\":true,\"identity\":{\"iss\":\"https://accounts.example.com\",\"sub\":\"110248495921238986421\",\"email\":\"new@example.com\",\"emailVerified\":true,\"display\":\"new@example.com\"}}"
+  },
+  {
+    "name": "fedsignup/n",
+    "routing": "fedsignup:example:20717",
+    "value": "3"
+  },
+  {
     "name": "signin/log",
     "routing": "did:plc:fixture0000000000000000",
     "value": "{\"entries\":[{\"id\":\"8899aabbccddeeff\",\"at\":1790000600,\"method\":\"federated\",\"provider\":\"Example\",\"clientId\":\"https://app.example/client-metadata.json\",\"device\":\"b:00112233445566778899aabbccddeeff\",\"userAgent\":\"Mozilla/5.0\",\"ip\":\"203.0.113.7\",\"factor\":\"passkey\"}],\"known\":[{\"device\":\"b:00112233445566778899aabbccddeeff\",\"last\":1790000600}],\"alertDay\":20717,\"alerts\":0}"
@@ -37,6 +47,6 @@
   {
     "name": "oauth/dev",
     "routing": "oauth:dev:dev-federated",
-    "value": "{\"id\":\"dev-federated\",\"created_at\":1790000000,\"last_seen_at\":1790000100,\"user_agent\":null,\"accounts\":[{\"did\":\"did:plc:fixture0000000000000000\",\"authenticated_at\":1790000050,\"auth_epoch\":\"00ff\",\"auth_cred\":\"fed:9d88d0f92b33084707e5577c pk:6688ea8f2669ad284d82b62e\"}],\"pending_2fa\":[\"did:plc:fixture0000000000000000\",1790000090],\"pending_2fa_failures\":1,\"pending_2fa_epoch\":\"00ff\",\"pending_2fa_first\":{\"cred\":\"fed:9d88d0f92b33084707e5577c\",\"provider\":\"Example\"}}"
+    "value": "{\"id\":\"dev-federated\",\"created_at\":1790000000,\"last_seen_at\":1790000100,\"user_agent\":null,\"accounts\":[{\"did\":\"did:plc:fixture0000000000000000\",\"authenticated_at\":1790000050,\"auth_epoch\":\"00ff\",\"auth_cred\":\"fed:9d88d0f92b33084707e5577c pk:6688ea8f2669ad284d82b62e\",\"app_handoff_until\":1790000170}],\"pending_2fa\":[\"did:plc:fixture0000000000000000\",1790000090],\"pending_2fa_failures\":1,\"pending_2fa_epoch\":\"00ff\",\"pending_2fa_first\":{\"cred\":\"fed:9d88d0f92b33084707e5577c\",\"provider\":\"Example\",\"app\":true}}"
   }
 ]

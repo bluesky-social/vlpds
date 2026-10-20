@@ -460,6 +460,7 @@ fn signin_providers() -> Vec<u8> {
         scopes: vec!["openid".into(), "email".into()],
         response_mode: ResponseMode::Query,
         signup: Signup::Off,
+        signups_per_day: 25,
         trust_email: true,
         required_claims: [("hd".to_string(), "example.com".to_string())].into(),
         id_token_algs: vec!["RS256".into()],

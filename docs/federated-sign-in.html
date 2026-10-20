@@ -589,7 +589,8 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   <li>Email is required. With <code>trustEmail</code> and <code>email_verified</code> the form is prefilled and the address is marked confirmed. The email policy (disposable domains) and uniqueness apply either way.</li>
   <li>Invites follow the provider's policy (<code>invite</code> needs one, <code>open</code> doesn't) and <code>--invite-required</code> still applies on top.</li>
   <li>The ambiguous-outcome check in account creation compares the password hash today, which an account without a password doesn't have. It compares the signing public key instead: a fresh key per request, already on the account, so the per-create nonce costs no new field.</li>
-  <li>The account page app gets provider buttons too. The provider sign-in runs on the server pages (second factor included), and a one-time, device-bound ticket hands the app a session (<code>vlpds.server.createFederatedSession</code>), so tokens never ride in a URL.</li>
+  <li>The account page app gets provider buttons too. The provider sign-in runs on the server pages (second factor included), and a one-time, device-bound handoff gives the app a session (<code>vlpds.server.createFederatedSession</code>), so tokens never ride in a URL. It's the full account-page session <code>createSession</code> gives this server's own page, so the OAuth-only switch doesn't apply to it, as it doesn't to the page's password sign-in.</li>
+  <li>Each provider makes at most <code>signupsPerDay</code> accounts a UTC day (default 100, 0 for no cap), counted cluster-wide, on top of the per-IP <code>create-account</code> limit.</li>
 </ul>
 </section>
 
@@ -749,6 +750,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   <li>Operator-side unlink and a per-account identity view in the console beyond the list.</li>
   <li>Front- or back-channel logout from providers. A provider sign-out doesn't end vlPDS sessions, as with any password manager's autofill.</li>
   <li>Encrypted id_tokens (JWE) and request objects to providers.</li>
+  <li>A provider step-up for what asks for the password: an account made with a provider sets a password by the email reset before it can delete itself, remove a passkey or reactivate after deactivating.</li>
   <li>An option to end the sessions a provider signed in when the operator removes it. Today its identities go dormant and their sessions run out on their own.</li>
 </ul>
 </section>

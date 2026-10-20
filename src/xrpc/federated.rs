@@ -55,6 +55,7 @@ pub fn xrpc_routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.removeSignInProvider", post(remove_provider))
         .route("/xrpc/vlpds.server.listFederatedIdentities", get(list_identities))
         .route("/xrpc/vlpds.server.describeSignInProviders", get(describe_providers))
+        .route("/xrpc/vlpds.server.createFederatedSession", post(create_federated_session))
 }
 
 /// The browser flow.
@@ -62,6 +63,7 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/oauth/federated/start", get(start_flow))
         .route("/oauth/federated/callback/{provider}", get(callback_get).post(callback_post))
+        .route("/oauth/federated/signup", post(signup_post))
 }
 
 pub fn internal_routes() -> Router<Arc<App>> {
@@ -125,6 +127,7 @@ fn provider_view(app: &App, p: &Provider) -> J {
         "scopes": p.scopes,
         "responseMode": p.response_mode,
         "signup": p.signup,
+        "signupsPerDay": p.signups_per_day,
         "trustEmail": p.trust_email,
         "requiredClaims": p.required_claims,
         "idTokenAlgs": p.id_token_algs,
@@ -195,6 +198,8 @@ struct ProviderIn {
     response_mode: Option<cfg::ResponseMode>,
     #[serde(default)]
     signup: Option<cfg::Signup>,
+    #[serde(default)]
+    signups_per_day: Option<u32>,
     #[serde(default)]
     trust_email: Option<bool>,
     #[serde(default)]
@@ -299,6 +304,7 @@ async fn put_provider(
         scopes: p.scopes.unwrap_or_else(|| vec!["openid".into(), "email".into()]),
         response_mode: p.response_mode.unwrap_or_default(),
         signup: p.signup.unwrap_or_default(),
+        signups_per_day: p.signups_per_day.unwrap_or(cfg::DEFAULT_SIGNUPS_PER_DAY),
         trust_email: p.trust_email.unwrap_or(false),
         required_claims: p.required_claims.unwrap_or_default(),
         id_token_algs: p.id_token_algs.unwrap_or_default(),
@@ -499,6 +505,30 @@ pub(super) struct FedState {
     /// device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// Started from the account page app, which gets the session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub app: bool,
+    /// A signup ticket (purpose "signup"): the identity and what the
+    /// provider said about its email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TicketIdentity>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TicketIdentity {
+    pub iss: String,
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub email_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -556,6 +586,9 @@ struct StartQ {
     link: Option<String>,
     #[serde(default)]
     csrf: Option<String>,
+    /// With `account`: the account page app gets the session.
+    #[serde(default)]
+    app: Option<String>,
 }
 
 /// `link`: the provider asks which of its accounts to use, so a link never
@@ -651,6 +684,8 @@ async fn start_flow(State(app): AppState, headers: HeaderMap, Query(q): Query<St
         created_at: now,
         expires_at: now + STATE_TTL,
         handoff: None,
+        app: purpose == "sign_in" && q.request_uri.is_none() && q.app.is_some(),
+        identity: None,
     };
     let val = Bytes::from(super::server::to_json_bytes(&row));
     let routing = state_routing(&state);
@@ -907,6 +942,10 @@ async fn finish(
     }
     let acct = match resolve(app, &id).await {
         Ok(Some(x)) => x,
+        Ok(None) if p.signup != cfg::Signup::Off && st.purpose == "sign_in" => {
+            count("unknown_identity");
+            return signup_ticket(app, headers, &p, &st, &id).await;
+        }
         Ok(None) => {
             count("unknown_identity");
             return failed(L::UnknownIdentity, N::Failed).await;
@@ -924,10 +963,302 @@ async fn finish(
     count("ok");
     note_used(app, &acct.did, &id.iss, &id.sub).await;
     let first = crate::oauth::store::FirstFactor {
+        app: st.app,
         cred: crate::federated::auth_ref(&id.iss, &id.sub),
         provider: p.name.clone(),
     };
     super::oauth::federated_continue(app, headers, ip, st.request_id.as_deref(), acct, epoch, first).await
+}
+
+/// A signup ticket lives this long: the user picks a handle and email.
+pub const SIGNUP_TTL: i64 = 15 * 60;
+
+fn invite_needed(app: &App, p: &Provider) -> bool {
+    p.signup == cfg::Signup::Invite || app.config.invite_required
+}
+
+/// An identity no account uses, on a provider that allows signup: a
+/// one-time ticket for this browser, and the form.
+async fn signup_ticket(
+    app: &App,
+    headers: &HeaderMap,
+    p: &Provider,
+    st: &FedState,
+    id: &crate::federated::oidc::Identity,
+) -> Response {
+    let ticket = crate::oauth::util::random_id("", 24);
+    let now = super::server::now_secs() as i64;
+    let row = FedState {
+        provider: p.id.clone(),
+        purpose: "signup".into(),
+        request_id: st.request_id.clone(),
+        did: None,
+        device_id: st.device_id.clone(),
+        created_at: now,
+        expires_at: now + SIGNUP_TTL,
+        handoff: None,
+        app: st.app,
+        identity: Some(TicketIdentity {
+            iss: id.iss.clone(),
+            sub: id.sub.clone(),
+            email: id.email.clone(),
+            email_verified: id.email_verified,
+            display: id.display.clone(),
+        }),
+    };
+    let val = Bytes::from(super::server::to_json_bytes(&row));
+    let routing = state_routing(&ticket);
+    match app.private_cas(&routing, vec![Cond::eq(STATE_ROW, None)], vec![Op::put(STATE_ROW, Some(val))]).await {
+        Ok(o) if o.applied => {}
+        Ok(_) => return page(app, StatusCode::INTERNAL_SERVER_ERROR, "Please try again."),
+        Err(e) => return page(app, e.status, &e.message),
+    }
+    let v = super::oauth::SignupValues {
+        handle: String::new(),
+        domain: String::new(),
+        email: id.email.clone().unwrap_or_default(),
+        invite_code: String::new(),
+    };
+    let verified = p.trust_email && id.email_verified;
+    super::oauth::federated_signup_page(
+        app,
+        headers,
+        st.request_id.as_deref(),
+        &ticket,
+        &p.name,
+        &v,
+        verified,
+        invite_needed(app, p),
+        None,
+        StatusCode::OK,
+    )
+    .await
+}
+
+/// The signup form: the ticket must be this browser's and current, the
+/// provider must still allow it, and the account is created with the
+/// identity and no password. The ticket is spent only once the account
+/// exists, so a refused handle can be retried; a second account can't be
+/// made with it, since the identity's claim already names the first.
+async fn signup_post(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+    body: AxBytes,
+) -> Response {
+    use crate::ratelimit as rl;
+    if !enabled(&app) {
+        return not_found();
+    }
+    let f: std::collections::HashMap<String, String> =
+        crate::oauth::util::parse_form(std::str::from_utf8(&body).unwrap_or("")).into_iter().collect();
+    let field = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let ticket = field("ticket");
+    if !valid_state(&ticket) {
+        return refused(&app, "sign_in", EXPIRED);
+    }
+    let routing = state_routing(&ticket);
+    let raw = match app.get_private(&routing, STATE_ROW).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return refused(&app, "sign_in", EXPIRED),
+        Err(e) => return page(&app, e.status, &e.message),
+    };
+    let st = match serde_json::from_slice::<FedState>(&raw) {
+        Ok(st) if st.purpose == "signup" && st.expires_at >= super::server::now_secs() as i64 => st,
+        _ => return refused(&app, "sign_in", EXPIRED),
+    };
+    let Some(device) = super::oauth::device_cookie_id(&headers).filter(|d| *d == st.device_id) else {
+        return refused(&app, "sign_in", "This sign-up was started in another browser. Please start again here.");
+    };
+    let csrf = super::oauth::device_csrf(&app, &device, &format!("fedsignup\0{ticket}"));
+    if !crate::auth::ct_eq(field("csrf").as_bytes(), csrf.as_bytes()) {
+        return page(&app, StatusCode::FORBIDDEN, "Invalid or missing CSRF token.");
+    }
+    let (Some(id), Some(p)) = (st.identity.clone(), app.federated.providers.get(&st.provider)) else {
+        return refused(&app, "sign_in", EXPIRED);
+    };
+    if p.issuer != id.iss || p.signup == cfg::Signup::Off {
+        return refused(&app, "sign_in", "Signing up this way is no longer offered here.");
+    }
+    if field("action") == "deny" {
+        let _ = app.private_cas(&routing, vec![Cond::eq(STATE_ROW, Some(raw))], vec![Op::put(STATE_ROW, None)]).await;
+        return super::oauth::federated_failed(
+            &app,
+            &headers,
+            st.request_id.as_deref(),
+            super::oauth::LoginError::Federated,
+        )
+        .await;
+    }
+    let v = super::oauth::SignupValues {
+        handle: field("handle").trim_start_matches('@').to_ascii_lowercase(),
+        domain: field("domain").to_ascii_lowercase(),
+        email: field("email"),
+        invite_code: field("invite_code"),
+    };
+    let verified = p.trust_email && id.email_verified;
+    let again = |msg: String, status: StatusCode| {
+        let (app, headers, st, ticket, p, v) = (&app, &headers, &st, &ticket, &p, &v);
+        async move {
+            super::oauth::federated_signup_page(
+                app,
+                headers,
+                st.request_id.as_deref(),
+                ticket,
+                &p.name,
+                v,
+                verified,
+                invite_needed(app, p),
+                Some(&msg),
+                status,
+            )
+            .await
+        }
+    };
+    if rl::check_ip(&[&rl::GLOBAL_IP, &rl::CREATE_ACCOUNT], 1).is_err() {
+        return again("Too many sign-up attempts. Please try again later.".into(), StatusCode::TOO_MANY_REQUESTS).await;
+    }
+    if invite_needed(&app, &p) && v.invite_code.is_empty() {
+        return again("An invite code is required.".into(), StatusCode::BAD_REQUEST).await;
+    }
+    let handle = match app.handle_domains.under(&v.handle) {
+        Some(_) => v.handle.clone(),
+        None => {
+            let domain = app.handle_domains.served(&v.domain).filter(|d| *d == v.domain);
+            format!("{}.{}", v.handle, domain.as_deref().unwrap_or(app.handle_domains.primary()))
+        }
+    };
+    let email_confirmed = verified && id.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&v.email));
+    let inp = super::server::CreateAccountIn {
+        handle,
+        email: Some(v.email.clone()),
+        password: None,
+        invite_code: Some(v.invite_code.clone()).filter(|c| !c.is_empty()),
+        federated: Some(NewIdentity {
+            iss: id.iss.clone(),
+            sub: id.sub.clone(),
+            provider: p.id.clone(),
+            display: id.display.clone(),
+        }),
+        email_confirmed,
+        ..Default::default()
+    };
+    match take_signup_slot(&app, &p).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let msg = format!("No more accounts can be created with {} today. Please try again tomorrow.", p.name);
+            return again(msg, StatusCode::TOO_MANY_REQUESTS).await;
+        }
+        Err(e) => return page(&app, e.status, &e.message),
+    }
+    let acct = match super::server::create_account_inner(&app, inp, None).await {
+        Ok(a) => a,
+        Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => return again(e.message, e.status).await,
+        Err(e) if e.status.is_server_error() => return page(&app, e.status, &e.message),
+        Err(e) => return again(e.message, StatusCode::BAD_REQUEST).await,
+    };
+    let _ = app.private_cas(&routing, vec![Cond::eq(STATE_ROW, Some(raw))], vec![Op::put(STATE_ROW, None)]).await;
+    crate::metrics::FEDERATED_IDENTITIES.with_label_values(&["linked"]).inc();
+    let epoch = match super::server::auth_epoch(&app, &acct.did).await {
+        Ok(e) => e,
+        Err(e) => return page(&app, e.status, &e.message),
+    };
+    let cred = crate::federated::auth_ref(&id.iss, &id.sub);
+    let ctx =
+        super::signin::Ctx { ip, user_agent: super::signin::user_agent(&headers), device_id: Some(&st.device_id) };
+    super::signin::record(&app, &acct, super::signin::Method::Federated(p.name.clone(), None), None, &ctx).await;
+    super::oauth::federated_signed_up(&app, &headers, st.request_id.as_deref(), &acct.did, epoch, cred, st.app).await
+}
+
+/// One of the provider's signups today (UTC), counted cluster-wide in a
+/// private row the GC drops after two days. False: today's are gone.
+async fn take_signup_slot(app: &App, p: &Provider) -> XResult<bool> {
+    if p.signups_per_day == 0 {
+        return Ok(true);
+    }
+    let day = super::server::now_secs() / 86_400;
+    let routing = signup_count_routing(&p.id, day);
+    for _ in 0..CAS_ROUNDS {
+        let raw = app.get_private(&routing, SIGNUP_COUNT_ROW).await?;
+        let n: u32 = raw.as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(0);
+        if n >= p.signups_per_day {
+            return Ok(false);
+        }
+        let val = Bytes::from(super::server::to_json_bytes(&(n + 1)));
+        let op = Op::put(SIGNUP_COUNT_ROW, Some(val));
+        if app.private_cas(&routing, vec![Cond::eq(SIGNUP_COUNT_ROW, raw)], vec![op]).await?.applied {
+            return Ok(true);
+        }
+    }
+    Err(super::server::cas_conflict())
+}
+
+pub const SIGNUP_COUNT_ROW: &str = "fedsignup/n";
+
+pub fn signup_count_routing(provider: &str, day: u64) -> String {
+    format!("fedsignup:{provider}:{day}")
+}
+
+/// The account page app's provider sign-in: a sign-in this browser just
+/// finished on the server's pages, asked for by the app (within two
+/// minutes), traded once for the session `createSession` would give.
+/// Same-origin only.
+async fn create_federated_session(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+) -> XResult<Response> {
+    crate::ratelimit::check_ip(&[&crate::ratelimit::OAUTH_SIGN_IN_IP], 1)?;
+    let none = || XrpcError::auth("No sign-in to pick up on this browser");
+    if !enabled(&app) || !super::server::own_page(&headers) {
+        return Err(none());
+    }
+    let id = super::oauth::device_cookie_id(&headers).ok_or_else(none)?;
+    let oauth_err =
+        |e: crate::oauth::OAuthError| XrpcError { status: e.status, error: e.error, message: e.description };
+    let (mut d, raw) = crate::oauth::store::get_device_raw(&app, &id).await.map_err(oauth_err)?.ok_or_else(none)?;
+    let now = super::server::now_secs() as i64;
+    let Some(i) = d
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.app_handoff_until >= now)
+        .max_by_key(|(_, a)| a.authenticated_at)
+        .map(|(i, _)| i)
+    else {
+        return Err(none());
+    };
+    let a = d.accounts[i].clone();
+    d.accounts[i].app_handoff_until = 0;
+    // once: the device row is cleared only if unchanged, and the pickup is
+    // claimed cluster-wide, so a writer holding an older copy of the row
+    // can't hand the same sign-in out again
+    if !crate::oauth::store::put_device_if(&app, &d, raw).await.map_err(oauth_err)? {
+        return Err(none());
+    }
+    let claim = format!("fedapp:{}:{}:{}", d.id, a.did, a.authenticated_at);
+    if !super::internal::claim_replay_anywhere(&app, &a.did, &claim, a.app_handoff_until).await? {
+        return Err(none());
+    }
+    if !super::oauth::device_accounts(&app, &d).await.iter().any(|(did, _)| *did == a.did) {
+        return Err(none());
+    }
+    let acct = super::internal::account_anywhere(&app, &a.did).await?;
+    let (access, refresh) =
+        super::server::create_session_tokens(&app, &a.did, None, false, Some(&a.auth_epoch), a.auth_cred.clone(), ip)
+            .await?;
+    // an unlink racing this either found the session or left the identity
+    // gone for this check (it writes the row before its scan)
+    if !super::passkeys::credentials_live(&app, &a.did, a.auth_cred.as_deref()).await? {
+        for r in crate::federated::cred_refs(a.auth_cred.as_deref()) {
+            super::server::revoke_signed_in_with(&app, &a.did, r).await?;
+        }
+        return Err(none());
+    }
+    let mut out = super::server::session_info(&app, &acct, true).await;
+    out["accessJwt"] = json!(access);
+    out["refreshJwt"] = json!(refresh);
+    Ok(Json(out).into_response())
 }
 
 /// The account the identity signs in to, and the credential epoch to sign
@@ -1044,6 +1375,47 @@ pub(super) async fn release_all(app: &App, did: &str) {
     }
 }
 
+/// The identity a provider signup creates its account with.
+#[derive(Clone, Debug)]
+pub struct NewIdentity {
+    pub iss: String,
+    pub sub: String,
+    pub provider: String,
+    pub display: Option<String>,
+}
+
+/// Account creation's claim, next to the handle's and the email's.
+pub(super) async fn claim_new(app: &App, f: &NewIdentity, did: &str) -> XResult<bool> {
+    claim(app, &f.iss, &f.sub, did).await
+}
+
+/// The new account's row, written before the account itself.
+pub(super) async fn write_new(app: &App, f: &NewIdentity, did: &str) -> XResult<()> {
+    let ids = Identities {
+        identities: vec![Linked {
+            iss: f.iss.clone(),
+            sub: f.sub.clone(),
+            provider: f.provider.clone(),
+            display: f.display.clone(),
+            added_at: super::server::now_secs(),
+            last_used_at: None,
+        }],
+    };
+    let val = Bytes::from(super::server::to_json_bytes(&ids));
+    if !app.private_cas(did, vec![Cond::eq(ROW, None)], vec![Op::put(ROW, Some(val))]).await?.applied {
+        return Err(super::server::cas_conflict());
+    }
+    Ok(())
+}
+
+/// A failed creation's claim and row; the DID is this creation's alone.
+pub(super) async fn release_new(app: &App, f: &NewIdentity, did: &str) {
+    release(app, &f.iss, &f.sub, did).await;
+    if let Err(e) = app.private_cas(did, Vec::new(), vec![Op::put(ROW, None)]).await {
+        tracing::warn!(%did, "dropping a failed creation's sign-in identities: {}", e.message);
+    }
+}
+
 pub(super) enum LinkErr {
     /// Another account has it.
     Taken,
@@ -1140,7 +1512,9 @@ pub(super) async fn unlink(app: &App, did: &str, r: &str) -> Result<Linked, Unli
             let gone = ids.identities.remove(i);
             let acct = app.account(did).await?;
             let (pk, pk_raw) = super::passkeys::load_raw(app, did).await?;
-            if acct.password_hash.is_empty() && pk.creds.is_empty() && ids.identities.is_empty() {
+            // a dormant identity (its provider gone) is no way in
+            let live = ids.identities.iter().any(|l| app.federated.providers.by_issuer(&l.iss).is_some());
+            if acct.password_hash.is_empty() && pk.creds.is_empty() && !(live && enabled(app)) {
                 return Err(UnlinkErr::LastCredential);
             }
             let val = (!ids.identities.is_empty()).then(|| Bytes::from(super::server::to_json_bytes(&ids)));
@@ -1243,6 +1617,8 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         created_at: 1_790_000_000,
         expires_at: 1_790_000_600,
         handoff,
+        app: false,
+        identity: None,
     };
     let link = FedState {
         provider: "wallet".into(),
@@ -1253,6 +1629,26 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         created_at: 1_790_000_000,
         expires_at: 1_790_000_600,
         handoff: None,
+        app: false,
+        identity: None,
+    };
+    let ticket = FedState {
+        provider: "example".into(),
+        purpose: "signup".into(),
+        request_id: None,
+        did: None,
+        device_id: "dev-fixture".into(),
+        created_at: 1_790_000_000,
+        expires_at: 1_790_000_900,
+        handoff: None,
+        app: true,
+        identity: Some(TicketIdentity {
+            iss: "https://accounts.example.com".into(),
+            sub: "110248495921238986421".into(),
+            email: Some("new@example.com".into()),
+            email_verified: true,
+            display: Some("new@example.com".into()),
+        }),
     };
     let handoff = Handoff {
         id_hash: "n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg".into(),
@@ -1266,6 +1662,8 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         (state_routing("st0aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), STATE_ROW.into(), enc(&state(None))),
         (state_routing("st1aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), STATE_ROW.into(), enc(&state(Some(handoff)))),
         (state_routing("st2aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), STATE_ROW.into(), enc(&link)),
+        (state_routing("st3aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), STATE_ROW.into(), enc(&ticket)),
+        (signup_count_routing("example", 20_717), SIGNUP_COUNT_ROW.into(), enc(&3u32)),
     ]
 }
 
@@ -1274,6 +1672,7 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
     match name {
         ROW if routing.starts_with("did:") => Some(typed_row::<Identities>("sign-in identities", val)),
         STATE_ROW if routing.starts_with("oauth:fed:") => Some(typed_row::<FedState>("sign-in provider flow", val)),
+        SIGNUP_COUNT_ROW if routing.starts_with("fedsignup:") => Some(typed_row::<u32>("provider signups today", val)),
         _ => None,
     }
 }

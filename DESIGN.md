@@ -4490,8 +4490,28 @@ Saves and removals are refused below level 2.
 - **Feature level 2** (`federated-sign-in`, persistent): gated per node on its
   own view of `cluster/version` (`federated::level`), so nothing federated is
   offered or written below it; builds without it exit 7 once it's active.
-- Not built yet: signup with a provider identity, the account page app's
-  provider sign-in (P2), the SIWE adapter interop test (P3).
+- **Signup** (P2): an unknown identity on a provider with `signup` on gets
+  a one-time ticket (a `purpose: "signup"` state row holding the identity,
+  15 min, this browser) and the form; `/oauth/federated/signup` creates the
+  account through `create_account_checked` with `federated` set: no
+  password (the public method still requires one), the identity's claim
+  next to the handle's and the email's, its row written before the repo, a
+  definite failure releasing all three and tombstoning the DID. The
+  ambiguous-outcome check compares the new signing key, not the password
+  hash. The ticket is spent only once the account exists; a second account
+  can't be made with it, since the claim names the first.
+  `signupsPerDay` (default 100, 0: no cap) is counted per provider and UTC
+  day in a private row (`fedsignup:{id}:{day}`, swept after two days),
+  taken right before the account is created. The public path never makes a
+  password-less account: an empty or blank password is "Password is
+  required" everywhere but the provider signup.
+- **The account page app**: a sign-in it started (`app=1`) marks the
+  device's account `app_handoff_until` (2 min), and
+  `vlpds.server.createFederatedSession` (same origin, the device cookie)
+  trades it once (a conditional write of the device row, then a durable
+  claim of the handoff) for a full legacy session under the sign-in's epoch
+  and credential references, as `createSession` gives this server's own page.
+- Not built yet: the SIWE adapter interop test (P3).
 Tests: `tests/all/federated.rs` (an in-process mock provider: link, sign-in
 to tokens, form_post handoff, every id_token check, unknown-kid refetch, state
 binding, TOTP, unlink and its revocations, dormant providers, the CLI, level

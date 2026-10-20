@@ -472,7 +472,7 @@ const OAUTH_IP_PATHS: [&str; 3] = ["/oauth/par", "/oauth/token", "/oauth/revoke"
 const OAUTH_FORM_PATHS: [&str; 3] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in", "/oauth/authorize/sign-up"];
 
 /// Third-party sign-in's pages, any method: also checked by the handler.
-const FEDERATED_PATHS: [&str; 2] = ["/oauth/federated/start", "/oauth/account/unlink"];
+const FEDERATED_PATHS: [&str; 3] = ["/oauth/federated/start", "/oauth/federated/signup", "/oauth/account/unlink"];
 
 pub const CREATE_POINTS: u32 = 3;
 pub const UPDATE_POINTS: u32 = 2;

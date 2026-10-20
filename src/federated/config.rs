@@ -64,6 +64,9 @@ pub struct Provider {
     pub response_mode: ResponseMode,
     #[serde(default)]
     pub signup: Signup,
+    /// Accounts it may create a UTC day, cluster-wide; 0: no cap.
+    #[serde(default = "default_signups_per_day")]
+    pub signups_per_day: u32,
     #[serde(default)]
     pub trust_email: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -75,6 +78,12 @@ pub struct Provider {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
+}
+
+pub const DEFAULT_SIGNUPS_PER_DAY: u32 = 100;
+
+fn default_signups_per_day() -> u32 {
+    DEFAULT_SIGNUPS_PER_DAY
 }
 
 fn default_scopes() -> Vec<String> {
@@ -493,6 +502,7 @@ pub(crate) mod tests {
             scopes: default_scopes(),
             response_mode: ResponseMode::Query,
             signup: Signup::Off,
+            signups_per_day: DEFAULT_SIGNUPS_PER_DAY,
             trust_email: false,
             required_claims: Default::default(),
             id_token_algs: vec![],
