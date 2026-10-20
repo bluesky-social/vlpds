@@ -254,7 +254,7 @@ function ProviderForm({ list, existing, close }: { list: ProviderList; existing?
             <Seg<ResponseMode> label="Response mode" value={d.responseMode} onChange={(responseMode) => set({ responseMode })} options={[{ v: 'query', label: 'query' }, { v: 'form_post', label: 'form_post' }]} />
           </div>
           <div>
-            <div className="cx-lbl" title="Sign-up through the provider. Ships as off until sign-up lands">
+            <div className="cx-lbl" title="What an identity no account uses may do: off refuses it, invite needs a code, open creates an account">
               Sign-up
             </div>
             <Seg<Signup> label="Sign-up" value={d.signup} onChange={(signup) => set({ signup })} options={(Object.keys(SIGNUP_LABEL) as Signup[]).map((v) => ({ v, label: SIGNUP_LABEL[v] }))} />

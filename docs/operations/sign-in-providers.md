@@ -88,10 +88,11 @@ A provider is one object. These are its fields.
 REGISTER"), so copy it from there. It must be `https`, and the form_post return needs that too.
 
 **Secrets never sit in the object in the clear.** A client secret or signing key is only ever
-entered as a value. The admin call wraps it under the KEK (purpose `sign-in-provider-secret`, bound
-to the provider id) and stores only the wrapped form. The list call returns `hasSecret`, never the
-value. A KEK rotation rewraps these with the rest (see [KEK and key rotation](kek-and-key-rotation.md)).
-There is no file form: a path accepted from the admin API could read any file the process can.
+entered as a value, `"secret": {"value": "…"}` or `"key": {"value": "…"}` in `clientAuth`. The admin
+call wraps it under the KEK (purpose `sign-in-provider-secret`, bound to the provider id) and stores
+only the wrapped form. The list call returns `{"stored": "wrapped"}` in its place, never the value.
+Leave it out of a `put` to keep the stored one. A KEK rotation rewraps these with the rest (see
+[KEK and key rotation](kek-and-key-rotation.md)). There is no file form: a path accepted from the admin API could read any file the process can.
 Changing a provider's `issuer` or `clientAuth` method needs the secret or key supplied again.
 
 **Client auth.** Most providers use `client_secret_basic` or `client_secret_post` with a plain
@@ -138,7 +139,7 @@ things around, so treat the names of their menus as a guide.
   "id": "google", "name": "Google",
   "issuer": "https://accounts.google.com",
   "clientId": "1234.apps.googleusercontent.com",
-  "clientAuth": { "method": "client_secret_basic", "secret": "<plaintext, wrapped on save>" },
+  "clientAuth": { "method": "client_secret_basic", "secret": { "value": "<plaintext, wrapped on save>" } },
   "scopes": ["openid", "email"], "responseMode": "query",
   "signup": "off", "trustEmail": true
 }
@@ -171,7 +172,7 @@ user's name and email behave differently.
   "clientId": "org.example.pds",
   "clientAuth": {
     "method": "client_secret_post",
-    "key": "<contents of the .p8, wrapped on save>", "keyId": "ABC123DEFG",
+    "key": { "value": "<contents of the .p8, wrapped on save>" }, "keyId": "ABC123DEFG",
     "signedSecret": { "issuer": "TEAMID1234", "lifetimeSecs": 3600 }
   },
   "scopes": ["openid", "email"], "responseMode": "form_post",
@@ -206,7 +207,7 @@ user's name and email behave differently.
   "id": "entra", "name": "Microsoft",
   "issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0",
   "clientId": "00000000-0000-0000-0000-000000000000",
-  "clientAuth": { "method": "client_secret_post", "secret": "<plaintext, wrapped on save>" },
+  "clientAuth": { "method": "client_secret_post", "secret": { "value": "<plaintext, wrapped on save>" } },
   "scopes": ["openid", "email"], "signup": "off"
 }
 ```
@@ -240,7 +241,7 @@ This is the easiest case, since the provider is yours.
   "id": "company", "name": "Company sign-in",
   "issuer": "https://idp.example.com/realms/staff",
   "clientId": "vlpds",
-  "clientAuth": { "method": "client_secret_basic", "secret": "<plaintext, wrapped on save>" },
+  "clientAuth": { "method": "client_secret_basic", "secret": { "value": "<plaintext, wrapped on save>" } },
   "scopes": ["openid", "email"], "signup": "off", "trustEmail": false
 }
 ```
