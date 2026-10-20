@@ -4,6 +4,7 @@ name: Image
 # the merge job tags one manifest list over both.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     tags: ["v*"]
