@@ -33,6 +33,15 @@ struct Code {
     nonce: String,
     challenge: String,
     redirect_uri: String,
+    /// A SIWE sign-in's subject (the wallet), else `IdpState::sub`.
+    sub: Option<String>,
+}
+
+/// An authorization a wallet has yet to sign for (the SIWE adapter mode).
+struct SiweRequest {
+    code: Code,
+    state: String,
+    siwe_nonce: String,
 }
 
 /// What the mock provider does: who signs in, and how to misbehave.
@@ -53,6 +62,10 @@ pub(crate) struct IdpState {
     /// Send the iss parameter on the authorization response.
     pub(crate) send_iss: Option<String>,
     codes: HashMap<String, Code>,
+    /// Act as a Sign-In with Ethereum adapter: `/authorize` asks the wallet
+    /// to sign an EIP-4361 message, `/siwe` checks it and issues the code.
+    pub(crate) siwe: bool,
+    siwe_requests: HashMap<String, SiweRequest>,
 }
 
 pub(crate) struct Idp {
@@ -117,6 +130,8 @@ impl Idp {
             client_key: None,
             send_iss: None,
             codes: HashMap::new(),
+            siwe: false,
+            siwe_requests: HashMap::new(),
         }));
         let jwks_hits = Arc::new(AtomicUsize::new(0));
         #[derive(Clone)]
@@ -150,14 +165,24 @@ impl Idp {
             assert_eq!(q.get("client_id").map(String::as_str), Some(CLIENT_ID));
             assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
             assert!(q["scope"].split(' ').any(|x| x == "openid"), "{q:?}");
-            st.codes.insert(
-                code.clone(),
-                Code {
-                    nonce: q["nonce"].clone(),
-                    challenge: q["code_challenge"].clone(),
-                    redirect_uri: q["redirect_uri"].clone(),
-                },
-            );
+            let pending = Code {
+                nonce: q["nonce"].clone(),
+                challenge: q["code_challenge"].clone(),
+                redirect_uri: q["redirect_uri"].clone(),
+                sub: None,
+            };
+            if st.siwe {
+                let request = format!("req-{}", rand::random::<u64>());
+                let siwe_nonce = format!("{:016x}", rand::random::<u64>());
+                st.siwe_requests.insert(
+                    request.clone(),
+                    SiweRequest { code: pending, state: q["state"].clone(), siwe_nonce: siwe_nonce.clone() },
+                );
+                let domain = s.issuer.trim_start_matches("http://").to_string();
+                return axum::Json(json!({"request": request, "nonce": siwe_nonce, "domain": domain, "uri": s.issuer}))
+                    .into_response();
+            }
+            st.codes.insert(code.clone(), pending);
             let mut pairs = vec![("code", code.clone()), ("state", q["state"].clone())];
             if let Some(i) = &st.send_iss {
                 pairs.push(("iss", i.clone()));
@@ -210,9 +235,10 @@ impl Idp {
                 return bad("invalid_grant");
             }
             let t = now();
+            let sub = c.sub.clone().unwrap_or_else(|| st.sub.clone());
             let mut claims =
-                json!({"iss": s.issuer, "aud": CLIENT_ID, "sub": st.sub, "iat": t, "exp": t + 300, "nonce": c.nonce});
-            if let Some(e) = &st.email {
+                json!({"iss": s.issuer, "aud": CLIENT_ID, "sub": sub, "iat": t, "exp": t + 300, "nonce": c.nonce});
+            if let (Some(e), None) = (&st.email, &c.sub) {
                 claims["email"] = json!(e);
                 claims["email_verified"] = json!(true);
             }
@@ -227,7 +253,47 @@ impl Idp {
             let id_token = sign(&key, &header, &claims);
             axum::Json(json!({"access_token": "at", "token_type": "Bearer", "id_token": id_token})).into_response()
         }
+        /// The wallet's signed message: the adapter checks it names this
+        /// adapter and the request's nonce, recovers the signer, and issues
+        /// a code whose subject is the wallet's address.
+        async fn siwe(State(s): State<S>, Form(f): Form<HashMap<String, String>>) -> Response {
+            let bad = |e: &str| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            let mut st = s.st.lock();
+            let Some(req) = st.siwe_requests.remove(f.get("request").map(String::as_str).unwrap_or("")) else {
+                return bad("unknown request");
+            };
+            let msg = f.get("message").cloned().unwrap_or_default();
+            let domain = s.issuer.trim_start_matches("http://");
+            let lines: Vec<&str> = msg.lines().collect();
+            let header = format!("{domain} wants you to sign in with your Ethereum account:");
+            let field = |k: &str| lines.iter().find_map(|l| l.strip_prefix(k)).map(str::to_string);
+            if lines.first() != Some(&header.as_str())
+                || field("Nonce: ").as_deref() != Some(req.siwe_nonce.as_str())
+                || field("Chain ID: ").as_deref() != Some("1")
+                || field("URI: ").as_deref() != Some(s.issuer.as_str())
+            {
+                return bad("message doesn't match the request");
+            }
+            let Some(claimed) = lines.get(1).map(|a| a.to_ascii_lowercase()) else { return bad("no address") };
+            match siwe_signer(&msg, f.get("signature").map(String::as_str).unwrap_or("")) {
+                Some(addr) if addr == claimed => {}
+                _ => return bad("signature isn't by the address in the message"),
+            }
+            let code = format!("code-{}", rand::random::<u64>());
+            let mut c = req.code;
+            c.sub = Some(format!("eip155:1:{claimed}"));
+            let redirect = format!(
+                "{}?code={code}&state={}",
+                c.redirect_uri,
+                vlpds::oauth::util::form_encode_component(&req.state)
+            );
+            st.codes.insert(code, c);
+            let mut r = axum::http::StatusCode::SEE_OTHER.into_response();
+            r.headers_mut().insert("location", redirect.parse().unwrap());
+            r
+        }
         let router = axum::Router::new()
+            .route("/siwe", axum::routing::post(siwe))
             .route("/.well-known/openid-configuration", axum::routing::get(discovery))
             .route("/jwks", axum::routing::get(jwks))
             .route("/authorize", axum::routing::get(authorize))
@@ -1265,4 +1331,195 @@ async fn signups_per_provider_are_capped_per_day() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- P3: SIWE through an OIDC adapter
+
+fn keccak(b: &[u8]) -> [u8; 32] {
+    use sha3::Digest as _;
+    sha3::Keccak256::digest(b).into()
+}
+
+/// EIP-191 `personal_sign` hash.
+fn eip191(msg: &str) -> [u8; 32] {
+    keccak(format!("\x19Ethereum Signed Message:\n{}{msg}", msg.len()).as_bytes())
+}
+
+fn eth_address(vk: &k256::ecdsa::VerifyingKey) -> String {
+    let pt = vk.to_sec1_point(false);
+    format!("0x{}", hex::encode(&keccak(&pt.as_bytes()[1..])[12..]))
+}
+
+/// The signer of a `personal_sign` signature (65 bytes: r, s, v), as a
+/// lowercase address.
+fn siwe_signer(msg: &str, sig_hex: &str) -> Option<String> {
+    let sig = hex::decode(sig_hex.trim_start_matches("0x")).ok()?;
+    if sig.len() != 65 {
+        return None;
+    }
+    let rec = k256::ecdsa::RecoveryId::from_byte(sig[64].checked_sub(27)?)?;
+    let s = k256::ecdsa::Signature::from_slice(&sig[..64]).ok()?;
+    let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&eip191(msg), &s, rec).ok()?;
+    Some(eth_address(&vk))
+}
+
+struct Wallet {
+    sk: k256::ecdsa::SigningKey,
+}
+
+impl Wallet {
+    fn new() -> Wallet {
+        Wallet { sk: k256::ecdsa::SigningKey::generate() }
+    }
+
+    fn address(&self) -> String {
+        eth_address(self.sk.verifying_key())
+    }
+
+    fn sign(&self, msg: &str) -> String {
+        let (sig, rec) = self.sk.sign_prehash_recoverable(&eip191(msg));
+        format!("0x{}{:02x}", hex::encode(sig.to_bytes()), 27 + rec.to_byte())
+    }
+
+    /// The EIP-4361 message for the adapter's challenge, as `address`.
+    fn message(challenge: &J, address: &str) -> String {
+        format!(
+            "{} wants you to sign in with your Ethereum account:\n{address}\n\nSign in to the PDS.\n\nURI: {}\nVersion: 1\nChain ID: 1\nNonce: {}\nIssued At: {}",
+            challenge["domain"].as_str().unwrap(),
+            challenge["uri"].as_str().unwrap(),
+            challenge["nonce"].as_str().unwrap(),
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+}
+
+/// A start link through the adapter: the wallet signs the challenge (as
+/// `claim`, its own address by default) and the browser comes back. The
+/// adapter's answer when it refuses.
+async fn through_wallet(
+    s: &Srv,
+    b: &mut Browser,
+    start: &str,
+    w: &Wallet,
+    claim: Option<&str>,
+) -> Result<Page, String> {
+    let (st, h, body) = b.get(s, &format!("{}{start}", s.base)).await;
+    assert_eq!(st, 303, "start: {body}");
+    let to_adapter = location(&h);
+    let r = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let challenge: J = r.get(&to_adapter).send().await.unwrap().json().await.unwrap();
+    let issuer = to_adapter.split("/authorize").next().unwrap().to_string();
+    let msg = Wallet::message(&challenge, claim.unwrap_or(&w.address()));
+    let resp = r
+        .post(format!("{issuer}/siwe"))
+        .form(&[("request", challenge["request"].as_str().unwrap()), ("message", &msg), ("signature", &w.sign(&msg))])
+        .send()
+        .await
+        .unwrap();
+    if resp.status().as_u16() != 303 {
+        return Err(resp.text().await.unwrap());
+    }
+    Ok(b.get(s, &location(resp.headers())).await)
+}
+
+/// A wallet signs up and signs in through an operator-run SIWE adapter,
+/// which is just another OpenID provider to the PDS: the identity is the
+/// adapter's issuer and the wallet's `eip155:1:0x…` subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn siwe_through_an_oidc_adapter() {
+    let s = spawn().await;
+    let adapter = Idp::start().await;
+    {
+        let mut st = adapter.state.lock();
+        st.siwe = true;
+        st.email = None;
+    }
+    add_provider(
+        &s,
+        &adapter,
+        "wallet",
+        json!({"name": "Ethereum", "signup": "open", "scopes": ["openid", "profile"]}),
+    )
+    .await;
+    let w = Wallet::new();
+
+    // signup on the OAuth page: no email from a wallet, so it's asked for and not confirmed
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto transition:email", &key);
+    let p = pkce();
+    let mut b = Browser::default();
+    let ru = f.request_uri(&s, &p, "st-siwe").await;
+    let (_, _, html) = b.authorize(&s, &f, &ru).await;
+    assert!(html.contains("Continue with Ethereum"), "{html}");
+    let start = href(&html, "/oauth/federated/start?provider=wallet").unwrap();
+    let (st, _, form) = through_wallet(&s, &mut b, &start, &w, None).await.unwrap();
+    assert_eq!(st, 200, "{form}");
+    assert!(form.contains("Create an account") && form.contains("name=\"email\" value=\"\""), "{form}");
+    let handle = format!("eth{}", rand::random::<u32>() % 100000);
+    let (st, _, consent) = post_signup(&s, &mut b, &form, &handle, "wallet-owner@example.com", "").await;
+    assert_eq!(st, 200, "{consent}");
+    let did = hidden_field(&consent, "did").unwrap();
+    let t = consent_and_token(&s, &mut b, &f, &p, &ru, &consent, &did).await;
+    let sess = session_of(&s, &key, &t).await;
+    assert_eq!((&sess["did"], &sess["emailConfirmed"]), (&json!(did), &json!(false)), "{sess}");
+
+    // the identity is the adapter's issuer and the wallet's address
+    let ids = s.app.get_private(&did, "fedid").await.ok().flatten().unwrap();
+    let ids: J = serde_json::from_slice(&ids).unwrap();
+    assert_eq!(ids["identities"][0]["sub"], json!(format!("eip155:1:{}", w.address())), "{ids}");
+    assert_eq!(ids["identities"][0]["iss"], json!(adapter.issuer));
+
+    // the same wallet signs in again from a fresh browser
+    let mut b2 = Browser::default();
+    let _ = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let p2 = through_wallet(&s, &mut b2, "/oauth/federated/start?provider=wallet&account=1", &w, None).await.unwrap();
+    assert!(signed_in(&p2), "{:?}", p2.0);
+
+    // a wallet claiming another's address never gets past the adapter
+    let thief = Wallet::new();
+    let start = "/oauth/federated/start?provider=wallet&account=1";
+    let refused = through_wallet(&s, &mut Browser::default(), start, &thief, Some(&w.address())).await;
+    assert!(refused.is_err(), "a signature by another key was accepted");
+    // and another wallet is another identity: a new signup, never this account
+    let mut b3 = Browser::default();
+    let _ = b3.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let (st, _, other) = through_wallet(&s, &mut b3, start, &thief, None).await.unwrap();
+    assert_eq!(st, 200);
+    assert!(other.contains("Create an account"), "{other}");
+}
+
+/// A password account adds its wallet, then signs in with it alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wallet_linked_to_an_existing_account() {
+    let s = spawn().await;
+    let adapter = Idp::start().await;
+    adapter.state.lock().siwe = true;
+    add_provider(&s, &adapter, "wallet", json!({"name": "Ethereum"})).await;
+    let acct = create_account(&s, "walletfan").await;
+    let w = Wallet::new();
+    let mut b = Browser::default();
+    device_sign_in(&s, &mut b, &acct).await;
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let add = href(&html, "/oauth/federated/start?provider=wallet").unwrap();
+    let (st, h, body) = through_wallet(&s, &mut b, &add, &w, None).await.unwrap();
+    assert_eq!((st, location(&h)), (303, "/oauth/account?notice=linked".to_string()), "{body}");
+    let mut b2 = Browser::default();
+    let _ = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let p = through_wallet(&s, &mut b2, "/oauth/federated/start?provider=wallet&account=1", &w, None).await.unwrap();
+    assert!(signed_in(&p));
+    let (_, _, page) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    assert!(page.contains(&acct.did), "signed in as the account: {page}");
+}
+
+/// The mock adapter's EIP-191 recovery against web3.js's documented vector
+/// (`web3.eth.accounts.sign('Some data', …)`), so the test speaks real SIWE.
+#[test]
+fn eip191_matches_web3() {
+    let sig = "0xb91467e570a6466aa9e9876cbcd013baba02900b8979d43fe208a4a4f339f5fd6007e74cd82e037b800186422fc2da167c747ef045e5d18a5f5d4300f8e1a0291c";
+    assert_eq!(siwe_signer("Some data", sig).as_deref(), Some("0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"));
+    let sk = k256::ecdsa::SigningKey::from_slice(
+        &hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(eth_address(sk.verifying_key()), "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23");
 }

@@ -334,7 +334,9 @@ edges:
 
 An operator can offer sign-in with accounts people hold elsewhere: Google, Apple, a company identity
 provider, or anything else through an OpenID Connect adapter the operator runs (Dex, Authentik,
-Keycloak, siwe-oidc and the like). vlpds speaks only OpenID Connect, and no provider is built in.
+Keycloak, siwe-oidc and the like). A wallet signing in through a Sign-In with Ethereum adapter, for
+one, is the adapter's issuer and a subject like `eip155:1:0x…` to vlpds, and the test suite drives
+exactly that. vlpds speaks only OpenID Connect, and no provider is built in.
 Each one is an entry in the cluster's `config/signin-providers.json`, edited from the console, the
 CLI (`vlpds admin signin-provider list|put|remove`) or `vlpds.admin.putSignInProvider`. Its secret
 or key is stored wrapped under the KEK. Each provider has its own callback URL to register with it,

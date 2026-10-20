@@ -4511,11 +4511,17 @@ Saves and removals are refused below level 2.
   trades it once (a conditional write of the device row, then a durable
   claim of the handoff) for a full legacy session under the sign-in's epoch
   and credential references, as `createSession` gives this server's own page.
-- Not built yet: the SIWE adapter interop test (P3).
+- **Other methods** (SIWE, GitHub, …) only through an OIDC adapter the
+  operator runs: vlpds sees an issuer and a subject. The interop test drives
+  a mock SIWE adapter (the mock provider in adapter mode: an EIP-4361
+  challenge, a `personal_sign` signature recovered to the wallet's address,
+  checked against web3.js's documented vector) through signup, sign-in,
+  linking to a password account and a wallet claiming another's address;
+  the identity is (the adapter's issuer, `eip155:1:0x…`).
 Tests: `tests/all/federated.rs` (an in-process mock provider: link, sign-in
 to tokens, form_post handoff, every id_token check, unknown-kid refetch, state
 binding, TOTP, unlink and its revocations, dormant providers, the CLI, level
-1), `federated::*` unit tests (claims, RS256/PS256/ES256/EdDSA, keys).
+1, signup, the account page app, SIWE through an adapter), `federated::*` unit tests (claims, RS256/PS256/ES256/EdDSA, keys).
 
 ## PLC identity (`src/plc`)
 
