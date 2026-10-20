@@ -313,6 +313,52 @@ password. Steps:
 Passkeys are bound to this PDS's hostname, so they don't move with the account
 ([Migration](migration.md)).
 
+## Third-party sign-in
+
+```diagram
+caption: "A provider sign-in on the OAuth page. The start link records a state bound to this browser, the provider sends the browser back with a code, and vlpds exchanges it and checks the id_token before it signs anyone in. The account's own second factor still follows."
+nodes:
+  - { id: page, label: sign-in page, sub: "\"Continue with …\"", at: [0, 0], size: [9, 3], tone: accent }
+  - { id: idp, label: provider, sub: OpenID Connect, at: [15, 0], size: [9, 3], tone: blue }
+  - { id: cb, label: callback, sub: "this browser · once", at: [30, 0], size: [9, 3], tone: accent }
+  - { id: tok, label: id_token checks, sub: "iss · aud · nonce · key", at: [30, 5.5], size: [9, 3], tone: violet }
+  - { id: acct, label: the account, sub: "linked identity", at: [15, 5.5], size: [9, 3], shape: store, tone: amber }
+  - { id: tfa, label: second factor, sub: if the account has one, at: [0, 5.5], size: [9, 3], tone: violet }
+edges:
+  - "page -> idp: state · nonce · PKCE"
+  - "idp -> cb: code"
+  - "cb -> tok: exchange"
+  - "tok -> acct: (iss, sub)"
+  - acct -> tfa
+```
+
+An operator can offer sign-in with accounts people hold elsewhere: Google, Apple, a company identity
+provider, or anything else through an OpenID Connect adapter the operator runs (Dex, Authentik,
+Keycloak, siwe-oidc and the like). vlpds speaks only OpenID Connect, and no provider is built in.
+Each one is an entry in the cluster's `config/signin-providers.json`, edited from the console, the
+CLI (`vlpds admin signin-provider list|put|remove`) or `vlpds.admin.putSignInProvider`. Its secret
+or key is stored wrapped under the KEK. Each provider has its own callback URL to register with it,
+`{public_url}/oauth/federated/callback/{id}`, which the callback checks against the flow (a defense
+against mix-ups between providers). With no provider configured
+nothing changes: no buttons, and the routes answer 404. It all waits for the cluster's feature level 2
+([Upgrades](operations/upgrades.md#feature-levels)).
+
+| | |
+|---|---|
+| Identity | the provider's issuer plus the `sub` of a validated id_token, never an email or the provider's name. One account per identity, held cluster-wide by a claim object `fedid/{sha256(iss, sub)}` and listed in the account's `fedid` row |
+| Checks | an exact issuer, our client id in `aud` (and in `azp` when there are several audiences), a fresh `iat`, `exp`, the flow's nonce, a signature by a key in the provider's JWKS (refetched at most once a minute for an unknown `kid`), RS256, PS256, ES256 or EdDSA only, the provider's required claims, and the response's `iss` when it sends one. There's no userinfo call |
+| The flow | the button is a GET link (so the page's CSP stays as it is). Its state is bound to the `vlpds-device` cookie and works once, and the nonce and PKCE verifier are MACs of it. A `form_post` response arrives cross-site without the cookie, so it's kept under a one-time id and checked on a same-origin GET |
+| Second factors | unchanged: TOTP, a passkey or the email code still follow a provider sign-in, unless the browser is trusted |
+| Adding one | on `/oauth/account`, after signing in there in the last 10 minutes · `federated-link-account`: 10 a day · the owner is mailed |
+| Removing one | on `/oauth/account`, the same way · refused if the account would have no password, passkey or other identity left · ends what it signed in |
+| Unknown identity | no sign-in: it's never matched to an account by email. Sign in another way and add it |
+| A provider removed | its identities stay on their accounts, unusable until a provider with the same issuer is added back |
+
+Sessions a provider signed in carry a `fed:` reference next to any passkey's, like `pk:`. Removing the
+identity deletes them, and device sign-ins and unexchanged codes it approved are refused when they're
+next used. App passwords and `createSession` don't change, and no app password is made for anyone.
+The design, with its threat table: [docs/federated-sign-in.html](https://github.com/jazware/vlpds/blob/main/docs/federated-sign-in.html).
+
 ## Trusted browsers
 
 ```diagram
@@ -488,10 +534,11 @@ Rate limits run before any hashing, so a flood from a few addresses or one accou
 |---|---|---|
 | `sign-in-account` | account, any IP (`createSession` and OAuth sign-in) | 100 per hour |
 | `com.atproto.server.createSession-0` / `-1` | identifier + IP | 300 per day / 30 per 5 min |
-| `oauth-sign-in-ip` | IP, OAuth sign-in form posts | 100 per 5 min |
+| `oauth-sign-in-ip` | IP, OAuth sign-in form posts and third-party sign-in's start and callback | 100 per 5 min |
 | `oauth-ip` | IP, `/oauth/par`, `/oauth/token`, `/oauth/revoke` | 3,000 per 5 min |
 | `passkey-sign-in-ip` | IP, the account page's passkey sign-in (`startPasskeySignIn`, `createPasskeySession`) | 100 per 5 min |
 | `passkey-register-account` | account, `startPasskeyRegistration` | 10 per day |
+| `federated-link-account` | account, adding or removing a third-party sign-in | 10 per day |
 
 An OAuth client whose backend calls `/oauth/token` for all its users from one address may need an IP override.
 Overrides and live changes are in the [admin console](operations/admin-console.md).

@@ -818,7 +818,7 @@ pub fn set_stale_claim_grace(app: &App, grace: std::time::Duration) {
 }
 
 /// (holder, version, age)
-async fn read_claim(
+pub(super) async fn read_claim(
     app: &App,
     path: &object_store::path::Path,
 ) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
@@ -846,6 +846,25 @@ async fn claim(
     did: &str,
     holds: impl Fn(&Account) -> bool,
 ) -> XResult<bool> {
+    let holds = &holds;
+    claim_with(app, path, did, |holder: String| async move {
+        match super::internal::account_anywhere(app, &holder).await {
+            Ok(a) => Ok(holds(&a)),
+            Err(e) if e.error == "AccountNotFound" => Ok(false),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+}
+
+/// [`claim`] with the holder's standing (Ok(true): an account stands on
+/// the claim) decided by `stands`; an error is never "no account".
+pub(super) async fn claim_with<F: std::future::Future<Output = XResult<bool>>>(
+    app: &App,
+    path: &object_store::path::Path,
+    did: &str,
+    stands: impl Fn(String) -> F,
+) -> XResult<bool> {
     let payload = || PutPayload::from(did.as_bytes().to_vec());
     let grace = std::time::Duration::from_millis(ext(app).claim_grace_ms.load(Ordering::Relaxed));
     for _ in 0..3 {
@@ -863,10 +882,7 @@ async fn claim(
         if age < grace {
             return Ok(false);
         }
-        let stale = match super::internal::account_anywhere(app, &holder).await {
-            Ok(a) => !holds(&a),
-            Err(e) => e.error == "AccountNotFound",
-        };
+        let stale = stands(holder.clone()).await.is_ok_and(|s| !s);
         if !stale || (version.e_tag.is_none() && version.version.is_none()) {
             return Ok(false);
         }
@@ -901,7 +917,7 @@ async fn try_release_email(app: &App, email: &str, did: &str) -> XResult<()> {
     Ok(())
 }
 
-async fn delete_claim(app: &App, path: &object_store::path::Path) -> XResult<()> {
+pub(super) async fn delete_claim(app: &App, path: &object_store::path::Path) -> XResult<()> {
     match app.store.raw.delete(path).await {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
         Err(e) => Err(XrpcError::from_err(e)),
@@ -1193,15 +1209,17 @@ pub(super) async fn revoke_everything(app: &App, did: &str) -> XResult<()> {
     revoke_all_sessions(app, did).await
 }
 
-/// The OAuth and legacy sessions a passkey (`auth_ref`) signed in. Device
-/// sign-ins and codes it approved are refused when used
-/// (`passkeys::still_registered`).
+/// The OAuth and legacy sessions a passkey or sign-in identity (`auth_ref`)
+/// signed in. Device sign-ins and codes it approved are refused when used
+/// (`passkeys::credentials_live`).
 pub(super) async fn revoke_signed_in_with(app: &App, did: &str, auth_ref: &str) -> XResult<()> {
-    let gone = delete_sessions_where(app, did, |_, st| st.auth_cred.as_deref() == Some(auth_ref)).await?;
+    let gone =
+        delete_sessions_where(app, did, |_, st| crate::federated::signed_in_with(st.auth_cred.as_deref(), auth_ref))
+            .await?;
     let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
     revoke_families(app, did, &fams).await?;
     for s in crate::oauth::store::list_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))? {
-        if s.auth_cred.as_deref() == Some(auth_ref) {
+        if crate::federated::signed_in_with(s.auth_cred.as_deref(), auth_ref) {
             crate::oauth::store::delete_session(app, did, &s.id)
                 .await
                 .map_err(|e| XrpcError::internal(e.description))?;
@@ -2570,6 +2588,7 @@ pub(super) async fn finish_delete(
         return Err(XrpcError::internal(format!("deletion of {did} stopped after the repo delete (crash hook)")));
     }
     super::space::delete_account_rows(app, did).await?;
+    super::federated::release_all(app, did).await;
     if let Some(d) = &intent {
         try_release_handle(app, &d.handle, did).await?;
         if let Some(e) = &d.email {

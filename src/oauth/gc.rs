@@ -15,6 +15,7 @@ use super::client::{
 use super::store::{self, Device, RequestData, Session};
 use super::{OAuthError, AUTHENTICATION_MAX_AGE, CODE_CHALLENGE_REPLAY_TIMEFRAME};
 use crate::xrpc::App;
+use serde_json::Value as J;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,7 @@ enum Kind {
     Replay,
     Revocation,
     Trust,
+    FederatedState,
 }
 
 fn classify(routing: &str, name: &str) -> Option<Kind> {
@@ -44,6 +46,8 @@ fn classify(routing: &str, name: &str) -> Option<Kind> {
         Some(Kind::Request)
     } else if routing.starts_with("oauth:cc:") && name == "oauth/cc" {
         Some(Kind::CodeChallenge)
+    } else if routing.starts_with("oauth:fed:") && name == "oauth/fed" {
+        Some(Kind::FederatedState)
     } else if routing.starts_with("oauth:dev:") && name == "oauth/dev" {
         Some(Kind::Device)
     } else if routing.starts_with("did:") && name.starts_with("oauth/ses/") {
@@ -88,6 +92,9 @@ fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool 
             .map(|d| now - d.last_seen_at > AUTHENTICATION_MAX_AGE && now > d.trusted_until)
             .unwrap_or(true),
         Kind::Session => serde_json::from_slice::<Session>(val).map(|s| session_expired(&s, now)).unwrap_or(true),
+        Kind::FederatedState => {
+            serde_json::from_slice::<J>(val).ok().and_then(|j| j["expiresAt"].as_i64()).is_none_or(|exp| exp < now)
+        }
     }
 }
 
@@ -100,7 +107,9 @@ fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     match kind {
         Kind::Request => format!("req:{}", routing.trim_start_matches("oauth:req:")),
         Kind::Session => format!("ses:{}", name.trim_start_matches("oauth/ses/")),
-        Kind::CodeChallenge | Kind::Device | Kind::Replay | Kind::Revocation | Kind::Trust => routing.to_string(),
+        Kind::CodeChallenge | Kind::Device | Kind::Replay | Kind::Revocation | Kind::Trust | Kind::FederatedState => {
+            routing.to_string()
+        }
     }
 }
 
@@ -231,6 +240,8 @@ mod tests {
         assert_eq!(classify("did:plc:x", "sec/td/rec/a/b"), None);
         assert_eq!(classify("did:plc:x", "trust/abc"), Some(Kind::Trust));
         assert_eq!(classify("oauth:dev:x", "trust/abc"), None);
+        assert_eq!(classify("oauth:fed:abc", "oauth/fed"), Some(Kind::FederatedState));
+        assert_eq!(classify("did:plc:x", "fedid"), None);
         assert_eq!(lock_key(Kind::Request, "oauth:req:req-1", "oauth/req"), "req:req-1");
         assert_eq!(lock_key(Kind::Session, "did:plc:x", "oauth/ses/ses-1"), "ses:ses-1");
     }
@@ -242,6 +253,9 @@ mod tests {
         assert!(!x(Kind::CodeChallenge, b"999999999"));
         assert!(x(Kind::CodeChallenge, (now - CODE_CHALLENGE_REPLAY_TIMEFRAME).to_string().as_bytes(),));
         assert!(x(Kind::Request, b"not json"));
+        assert!(!x(Kind::FederatedState, format!("{{\"expiresAt\":{now}}}").as_bytes()));
+        assert!(x(Kind::FederatedState, format!("{{\"expiresAt\":{}}}", now - 1).as_bytes()));
+        assert!(x(Kind::FederatedState, b"{}"));
         assert!(!x(Kind::Replay, (now + 1).to_string().as_bytes()));
         assert!(x(Kind::Replay, now.to_string().as_bytes()));
         let rvk = |val: &[u8]| expired(Kind::Revocation, "did:plc:x", "sec/rvk/f/fam", val, now);

@@ -232,8 +232,8 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   <text x="652" y="350" class="d-m">fedid/{sha256(iss \0 sub)} → DID</text>
   <text x="652" y="370" class="d-m">p/{did}\0fedid</text>
   <text x="652" y="390" class="d-m">p/oauth:fed:{state}\0oauth/fed</text>
-  <text x="652" y="418" class="d-s">secrets KEK-wrapped or files</text>
-  <text x="652" y="436" class="d-s">on the nodes, never in clear</text>
+  <text x="652" y="418" class="d-s">secrets only KEK-wrapped,</text>
+  <text x="652" y="436" class="d-s">never in clear, never a file</text>
 
   <line x1="176" y1="80" x2="228" y2="80" class="d-line" marker-end="url(#am)"/>
   <line x1="176" y1="229" x2="228" y2="100" class="d-line" marker-end="url(#am)"/>
@@ -293,7 +293,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
 <tr><td><code>id</code></td><td>the operator's short name, <code>[a-z0-9-]</code>, 1 to 32</td><td>in URLs and labels only. Renaming it changes nothing about identities</td></tr>
 <tr><td><code>name</code>, <code>icon</code></td><td>button text and an optional icon</td><td>icon: a <code>data:image/…</code> URI of 16 KiB at most, so the pages' CSP (<code>img-src 'self' data:</code>) stays as it is</td></tr>
 <tr><td><code>issuer</code></td><td>the OIDC issuer URL</td><td>https (http only in dev mode or to loopback). Discovery's <code>issuer</code> must equal it byte for byte. Unique among providers</td></tr>
-<tr><td><code>clientId</code></td><td>this PDS's client id at the provider</td><td>the redirect URI to register is <code>{public_url}/oauth/federated/callback</code>, one for every provider</td></tr>
+<tr><td><code>clientId</code></td><td>this PDS's client id at the provider</td><td>the redirect URI to register is <code>{public_url}/oauth/federated/callback/{id}</code>, one per provider, checked against the flow&#39;s provider (RFC 9700 §4.4.2)</td></tr>
 <tr><td><code>clientAuth</code></td><td><code>client_secret_basic</code>, <code>client_secret_post</code> or <code>private_key_jwt</code></td><td>a secret, or a P-256 key and key id. For the "client secret is a JWT we sign" variant some providers need, <code>signedSecret</code> names the JWT's issuer (a team id), audience and lifetime, and vlPDS mints and caches it with the key</td></tr>
 <tr><td><code>scopes</code></td><td>default <code>openid email</code></td><td><code>openid</code> is always sent</td></tr>
 <tr><td><code>responseMode</code></td><td><code>query</code> or <code>form_post</code></td><td>some providers require <code>form_post</code> when they return a name or email</td></tr>
@@ -314,12 +314,12 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   }, {
     "id": "apple", "name": "Apple", "issuer": "https://appleid.apple.com",
     "clientId": "org.example.pds",
-    "clientAuth": {"method": "client_secret_post", "key": {"file": "/run/vlpds/apple.p8"}, "keyId": "ABC123",
+    "clientAuth": {"method": "client_secret_post", "key": {"wrapped": "vw1.G….…"}, "keyId": "ABC123",
                    "signedSecret": {"issuer": "TEAMID", "lifetimeSecs": 3600}},
     "responseMode": "form_post", "signup": "off"
   }]
 }</pre>
-<p>Secrets never sit in the object in the clear. The admin API takes a plaintext value and stores it wrapped under the KEK (new purpose <code>sign-in-provider-secret</code>, subject the provider id), or takes a <code>file</code> path that every node reads, like the other <code>*_FILE</code> secrets. The list call returns <code>hasSecret</code> and the file path, never the value. <code>rewrapSecrets</code> rewraps them with the rest.</p>
+<p>Secrets never sit in the object in the clear. The admin API takes a plaintext value and stores it wrapped under the KEK (new purpose <code>sign-in-provider-secret</code>, subject the provider id). There is no file form: an admin API that names files would let any operator login read a file on the node and post it to a token endpoint of its choosing. The list call says a secret is stored, never its value. <code>rewrapSecrets</code> rewraps them with the rest.</p>
 <p>Admin surface: <code>vlpds.admin.listSignInProviders</code>, <code>putSignInProvider</code> (create or replace, <code>ifVersion</code>), <code>removeSignInProvider</code>, the CLI's <code>vlpds admin signin-provider list|put|remove</code> and a console page. Saves and removals are audited (<code>signin_provider.put</code>, <code>signin_provider.remove</code>).</p>
 </section>
 
@@ -423,7 +423,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
 <tr><td>required claims</td><td>each configured claim equals its value</td><td>e.g. one hosted domain</td></tr>
 <tr><td>authorization response <code>iss</code></td><td>when the callback carries one (RFC 9207) it equals the issuer, and it is required when discovery says the provider sends it</td><td>mix-up between providers that share the callback URL</td></tr>
 </tbody></table></div>
-<p>Discovery (<code>{issuer}/.well-known/openid-configuration</code>) and the JWKS go through the client for operator-configured upstreams, not the SSRF-guarded one, because an adapter may well run on the operator's private network. Both are cached for an hour (a failed refresh keeps the last good copy for a day), capped at 256 KiB, with 10 s deadlines. <code>email_verified</code> is accepted as a boolean or the strings <code>"true"</code>/<code>"false"</code>, since some providers send strings.</p>
+<p>Discovery (<code>{issuer}/.well-known/openid-configuration</code>), the JWKS and the token endpoint go through the SSRF-guarded client, unless the issuer itself is a non-public address (an adapter on the operator's network), whose endpoints are then fetched as configured. Plain http only to a loopback issuer or in dev mode. Fetches are single-flight per URL and a failure is remembered for 10 s. Both are cached for an hour (a failed refresh keeps the last good copy for a day), capped at 256 KiB, with 10 s deadlines. <code>email_verified</code> is accepted as a boolean or the strings <code>"true"</code>/<code>"false"</code>, since some providers send strings.</p>
 </section>
 
 <section>
@@ -484,7 +484,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
 </div>
 <figcaption>The claim object makes an identity belong to one account cluster-wide; the account's row is what counts. A claim without a row (a link that died between the two writes) is taken over once it is older than the claim grace and its holder doesn't list it, the same rule handle and email claims follow.</figcaption>
 </figure>
-<p><b>Where.</b> Adding and removing happen on <code>/oauth/account</code>, the server-rendered page tied to the browser's device cookie, never through a bearer-token API. A fresh sign-in there (password with its second factor, a passkey, or an identity already linked, within the last 10 minutes on this browser) is the step-up, so a stolen account-page token can't add a way into the account. The account page app's Security tab lists the identities (<code>vlpds.server.listFederatedIdentities</code>) and sends the user to <code>/oauth/account</code> to change them. Add is a GET link carrying a CSRF token (a POST would trip <code>form-action</code> on the redirect to the provider). Remove is a form post.</p>
+<p><b>Where.</b> Adding and removing happen on <code>/oauth/account</code>, the server-rendered page tied to the browser's device cookie, never through a bearer-token API. A fresh sign-in there (password with its second factor, a passkey, or an identity already linked, within the last 10 minutes on this browser) is the step-up, so a stolen account-page token can't add a way into the account. The account page app's Security tab lists the identities (<code>vlpds.server.listFederatedIdentities</code>) and sends the user to <code>/oauth/account</code> to change them. Add is a GET link carrying a CSRF token with its issue time, good for the same 10 minutes (a POST would trip <code>form-action</code> on the redirect to the provider), and it asks the provider to let the user pick an account (<code>prompt=select_account</code>), so a link never silently takes whichever account the browser is signed in to there. Remove is a form post.</p>
 <p><b>Limits.</b> 10 identities per account, one per issuer. Linking is rate-limited per account (<code>federated-link-account</code>, 10 a day). Every add and remove mails the owner ("Your Account's Sign-in Settings Changed").</p>
 <p><b>Never by email.</b> An identity is linked only by someone already signed in to the account. Its email is kept as a label for the list and nothing else, and later sign-ins don't update the account's email.</p>
 </section>
@@ -499,7 +499,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   <text x="32" y="40" class="d-w">bucket objects</text>
   <rect x="32" y="54" width="388" height="112" rx="6" class="d-box"/>
   <text x="44" y="76" class="d-m">{prefix}/config/signin-providers.json</text>
-  <text x="44" y="96" class="d-s">every provider; secrets wrapped or file paths</text>
+  <text x="44" y="96" class="d-s">every provider; secrets KEK-wrapped</text>
   <text x="44" y="114" class="d-s">CAS by version; re-read by every node every 10 s</text>
   <text x="44" y="132" class="d-s">absent: no providers</text>
   <text x="44" y="152" class="d-s">old builds never read it</text>
@@ -678,7 +678,8 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
 <tr><td>Algorithm confusion</td><td>allowlist without <code>none</code> or HMAC; <code>alg</code> must match the key type; <code>kid</code> required</td></tr>
 <tr><td>JWKS refetch storm from made-up kids</td><td>refetch at most once a minute per provider; the cached keys stay in use</td></tr>
 <tr><td>Identity from an unvalidated source</td><td><code>sub</code> only from a validated id_token; no userinfo fallback</td></tr>
-<tr><td>Mix-up between providers sharing the callback</td><td>the state names the provider; <code>iss</code> checked in the token and in the authorization response when present</td></tr>
+<tr><td>Mix-up between providers</td><td>a callback URL per provider, checked against the state&#39;s provider; the state names the provider; <code>iss</code> checked in the token and in the authorization response when present</td></tr>
+<tr><td>A provider&#39;s discovery pointing this node at its own network</td><td>a public issuer&#39;s token and JWKS endpoints go through the SSRF-guarded client; only an issuer that is itself a non-public address is fetched as configured</td></tr>
 <tr><td>Takeover through a matching email at another provider</td><td>never find or link an account by email; identity key is (iss, sub)</td></tr>
 <tr><td>Provider renamed or two configs for one issuer</td><td>identities keyed by issuer, never the provider id; one provider per issuer</td></tr>
 <tr><td>Stolen account-page token adds a lasting way in</td><td>no bearer-token link API; link needs a full sign-in on this device in the last 10 min; the owner is mailed on every change</td></tr>
@@ -686,7 +687,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
 <tr><td>Locking oneself out by unlinking</td><td>refused unless a password, a passkey or another identity remains, held by conditional writes on those rows</td></tr>
 <tr><td>A session outlives its unlink</td><td><code>fed:</code> refs on every session; unlink revokes them; device sign-ins and codes are checked when used</td></tr>
 <tr><td>A compromised provider signs in as its users</td><td>inherent in trusting an issuer. Second factors still apply, <code>requiredClaims</code> narrow who gets in, and removing the provider makes its identities dormant at once</td></tr>
-<tr><td>Provider secrets read from a bucket copy</td><td>KEK-wrapped with the provider id in the associated data, or files on the nodes; never returned by the API</td></tr>
+<tr><td>Provider secrets read from a bucket copy</td><td>KEK-wrapped with the provider id in the associated data; never returned by the API; no file form an operator login could point at the node&#39;s own files</td></tr>
 <tr><td>A mixed cluster half-supporting the feature</td><td>feature level 2; nothing federated is written before it, and old builds exit 7 after it</td></tr>
 <tr><td>Open redirect through start or callback</td><td>no caller-supplied return URL; the destination comes from the state row (an OAuth request, <code>/oauth/account</code> or <code>/account</code>)</td></tr>
 <tr><td>Look-alike provider buttons</td><td>names escaped; icons only as small <code>data:</code> images under the pages' CSP; only the operator configures providers</td></tr>
@@ -748,6 +749,7 @@ pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background:
   <li>Operator-side unlink and a per-account identity view in the console beyond the list.</li>
   <li>Front- or back-channel logout from providers. A provider sign-out doesn't end vlPDS sessions, as with any password manager's autofill.</li>
   <li>Encrypted id_tokens (JWE) and request objects to providers.</li>
+  <li>An option to end the sessions a provider signed in when the operator removes it. Today its identities go dormant and their sessions run out on their own.</li>
 </ul>
 </section>
 </main>

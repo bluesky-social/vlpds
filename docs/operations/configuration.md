@@ -77,7 +77,7 @@ edges:
   (`PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`, `PDS_EMAIL_SMTP_URL`, `PDS_INVITE_INTERVAL`, ...), so
   an existing `pds.env` mostly carries over.
 - Some settings live in the bucket. The shard layout, the active feature level, the rate-limit config,
-  the relay list and the added handle domains are cluster-wide, and you change them at runtime from the
+  the relay list, the added handle domains and the third-party sign-in providers are cluster-wide, and you change them at runtime from the
   [admin console](admin-console.md) or `vlpds admin`. A crawler list set in the console overrides
   `--crawlers` until it's reset.
 - To check a config, run `vlpds --memory-plan` with the same flags. It prints the memory plan as JSON
