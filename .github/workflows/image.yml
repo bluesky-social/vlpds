@@ -131,7 +131,8 @@ jobs:
           args=()
           while IFS= read -r t; do args+=(-t "$t"); done < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
           while IFS= read -r a; do args+=(--annotation "$a"); done < <(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
-          docker buildx imagetools create "${args[@]}" $(printf "$IMAGE@sha256:%s " *)
+          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"
           docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
           digest=$(docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
