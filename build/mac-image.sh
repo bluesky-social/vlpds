@@ -10,10 +10,10 @@
 # Builds the committed tree (vcs_archive), as benchbox-image.sh does, so
 # uncommitted edits never reach an image.
 #
-# Env: IMAGE (ghcr.io/jazware/vlpds), PLATFORM (linux/amd64), FEATURES
+# Env: IMAGE (ghcr.io/bluesky-social/vlpds), PLATFORM (linux/amd64), FEATURES
 # (cargo features, e.g. profiling), CARGO_BUILD_JOBS, PUSH=0 (load only).
 set -euo pipefail
-IMAGE=${IMAGE:-ghcr.io/jazware/vlpds}
+IMAGE=${IMAGE:-ghcr.io/bluesky-social/vlpds}
 vcs="$(dirname "$0")/../../../scripts/vcs.sh"
 if [ -f "$vcs" ]; then
   . "$vcs"
