@@ -63,6 +63,8 @@ jobs:
       # Every test boots an in-process server on the in-memory store, so the
       # suite needs no MinIO or docker.
       - run: cargo test --locked --test all --test argon2_shed --test fresh_metrics
+      - run: cargo test --locked --features test-level --test level_gating
+      - run: python3 -m unittest discover -s bench/ha -p 'test_hactl.py'
 
   go:
     name: Go helpers

@@ -2412,8 +2412,8 @@ def upgrade_checks(ctx, res, finalized, new_formats):
             fails.append(f"{r['node']} on {r['build']} exited {r['rc']}, expected [7] (incompatible_level)")
     res["refusals"] = ctx.ret.get("refusals", [])
     res["cluster_version"] = v = cluster_version(ctx)
-    if v and finalized is not None and v.get("active") != finalized:
-        fails.append(f"active level {v.get('active')}, expected {finalized}")
+    if finalized is not None and (v or {}).get("active") != finalized:
+        fails.append(f"active level {(v or {}).get('active')}, expected {finalized}")
     for nid in ctx.ret.get("refused_ids", []):
         left = node_objects(ctx.prefix, nid)
         if left:
@@ -2472,14 +2472,23 @@ def s_upgrade_rolling_l1(ctx):
           "(an old node is live); roll both back to the old build; nothing in the new format ever written")
 def s_upgrade_rollback(ctx):
     upgrade_ctx(ctx)
-    acts = [(8, swap_build(1, NEW_TL_BIN, "new")), (8.01, audit_from_start(1)),
+
+    def capture_initial_level(ctx):
+        level = (cluster_version(ctx) or {}).get("active")
+        if type(level) is not int or level < 1:
+            raise RuntimeError("could not read the active level before upgrading")
+        ctx.ret["initial_active_level"] = level
+
+    acts = [(0, capture_initial_level),
+            (8, swap_build(1, NEW_TL_BIN, "new")), (8.01, audit_from_start(1)),
             (17, swap_build(2, NEW_TL_BIN, "new")), (17.01, audit_from_start(2)),
             (25, finalize(1, 409)),
             (28, swap_build(2, OLD_BIN, "old (rollback)")), (28.01, audit_from_start(2)),
             (36, swap_build(1, OLD_BIN, "old (rollback)")), (36.01, audit_from_start(1)),
             (38, checker_with_cursor(2, back_s=25))]
     res = run_load_scenario(ctx, 3, 50, acts, node_bins=[OLD_BIN] * 3)
-    return upgrade_checks(ctx, res, finalized=REAL_MAX, new_formats=False)
+    res["initial_active_level"] = ctx.ret["initial_active_level"]
+    return upgrade_checks(ctx, res, finalized=ctx.ret["initial_active_level"], new_formats=False)
 
 
 @scenario("upgrade-old-refused",

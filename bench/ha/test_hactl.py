@@ -9,6 +9,8 @@ import glob
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hactl  # noqa: E402
@@ -52,6 +54,43 @@ class ParseLogObject(unittest.TestCase):
             hactl.parse_log_object(b"VLSEG07\n" + plain[8:])
         with self.assertRaisesRegex(hactl.SegmentFormatError, "truncated|bytes"):
             hactl.parse_log_object(plain[:-3])
+
+
+class UpgradeRollback(unittest.TestCase):
+    def run_rollback(self, initial_version, final_version):
+        ctx = SimpleNamespace(ret={}, prefix="rollback-test", nodes=[])
+
+        def run_load(ctx, n_nodes, duration, actions, **kwargs):
+            # Start-of-load actions run after the old cluster is ready.
+            self.assertEqual(actions[0][0], 0)
+            actions[0][1](ctx)
+            return {"exit_codes": {"n1": [0], "n2": [0], "n3": [0]}}
+
+        with mock.patch.object(hactl, "upgrade_ctx"), \
+                mock.patch.object(hactl, "run_load_scenario", side_effect=run_load), \
+                mock.patch.object(hactl, "cluster_version", side_effect=[initial_version, final_version]), \
+                mock.patch.object(hactl, "segment_magics", return_value={"VLSEG06": 10}), \
+                mock.patch.object(hactl, "log"):
+            return hactl.s_upgrade_rollback(ctx)
+
+    def test_preserves_level_one_and_level_two_clusters(self):
+        for level in (1, 2):
+            with self.subTest(level=level):
+                result = self.run_rollback({"active": level}, {"active": level})
+                self.assertFalse(result.get("k_fail"), result)
+                self.assertEqual(result["initial_active_level"], level)
+
+    def test_rejects_changed_or_unreadable_final_level(self):
+        for initial, final in ((1, {"active": 2}), (2, {"active": 1}), (1, None)):
+            with self.subTest(initial=initial, final=final):
+                result = self.run_rollback({"active": initial}, final)
+                self.assertTrue(any("active level" in failure for failure in result["k_fail"]), result)
+
+    def test_requires_initial_level_evidence(self):
+        for version in (None, {}, {"active": 0}, {"active": True}):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(RuntimeError, "active level before upgrading"):
+                    self.run_rollback(version, {"active": 1})
 
 
 if __name__ == "__main__":
